@@ -873,4 +873,4 @@ go test -run '^$' -bench . -benchmem -count=1
 
 ## License
 
-MIT License
+Apache License 2.0
