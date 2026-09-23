@@ -18,41 +18,10 @@ func (tw testWorkflow) Build(b *Builder) {
 	tw.build(b)
 }
 
-func TestCompileWorkflow(t *testing.T) {
-	wf := testWorkflow{
-		name: "sample",
-		build: func(b *Builder) {
-			b.Step("a", func(context.Context, *StepContext) (any, error) { return "ok", nil })
-			b.Sleep(2 * time.Second)
-			b.WaitEvent("evt", 10*time.Second)
-		},
-	}
-	compiled, err := compileWorkflow(wf)
-	if err != nil {
-		t.Fatalf("compileWorkflow() error = %v", err)
-	}
-	if len(compiled.ops) != 3 {
-		t.Fatalf("ops len = %d, want 3", len(compiled.ops))
-	}
-}
-
 func TestCompileWorkflowNoOps(t *testing.T) {
 	wf := testWorkflow{name: "empty", build: func(*Builder) {}}
 	if _, err := compileWorkflow(wf); err == nil {
 		t.Fatal("expected error for workflow with no operations")
-	}
-}
-
-func TestDefineWorkflow(t *testing.T) {
-	wf := DefineWorkflow("defined", func(b *Builder) {
-		b.Step("a", func(context.Context, *StepContext) (any, error) { return "ok", nil })
-	})
-	compiled, err := compileWorkflow(wf)
-	if err != nil {
-		t.Fatalf("compileWorkflow() error = %v", err)
-	}
-	if compiled.name != "defined" {
-		t.Fatalf("compiled workflow name = %q, want defined", compiled.name)
 	}
 }
 

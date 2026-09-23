@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -29,6 +30,7 @@ type StepContext struct {
 	RunID    WorkflowID
 	Workflow string
 	Input    json.RawMessage
+	StepKey  string
 
 	values map[string]json.RawMessage
 }
@@ -104,6 +106,15 @@ func (sc *StepContext) RawValue(step string) (json.RawMessage, bool) {
 	return cp, true
 }
 
+// IdempotencyKey identifies this run and step across retries and lease recovery.
+// Pass it to external systems that support idempotent operations.
+func (sc *StepContext) IdempotencyKey() string {
+	if sc == nil || sc.RunID == "" || sc.StepKey == "" {
+		return ""
+	}
+	return string(sc.RunID) + ":" + sc.StepKey
+}
+
 // Config configures Engine.
 type Config struct {
 	DB                *pgxpool.Pool
@@ -113,6 +124,7 @@ type Config struct {
 	PollInterval      time.Duration
 	LeaseTTL          time.Duration
 	HeartbeatInterval time.Duration
+	Logger            *slog.Logger
 }
 
 // EnqueueOption configures Enqueue.
@@ -122,11 +134,19 @@ type EnqueueOption func(*enqueueOptions)
 type RunOption = EnqueueOption
 
 type enqueueOptions struct {
-	runID          WorkflowID
-	queue          string
-	maxAttempts    int
-	idempotencyKey string
-	scheduledAt    *time.Time
+	runID           WorkflowID
+	workflowVersion int
+	queue           string
+	maxAttempts     int
+	idempotencyKey  string
+	scheduledAt     *time.Time
+}
+
+// WithWorkflowVersion selects a registered definition instead of the latest.
+func WithWorkflowVersion(version int) EnqueueOption {
+	return func(o *enqueueOptions) {
+		o.workflowVersion = version
+	}
 }
 
 // WithRunID provides a deterministic run ID.

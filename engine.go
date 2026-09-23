@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"runtime"
 	"strings"
@@ -14,7 +15,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -29,6 +29,11 @@ const (
 )
 
 var identPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+type workflowKey struct {
+	name    string
+	version int
+}
 
 // Engine executes durable workflows using PostgreSQL.
 type Engine struct {
@@ -46,9 +51,11 @@ type Engine struct {
 	workerID       string
 
 	mu        sync.RWMutex
-	workflows map[string]*compiledWorkflow
+	workflows map[workflowKey]*compiledWorkflow
+	logger    *slog.Logger
 
-	stepGroup singleflight.Group
+	// Claims can outlive StartWorker's bounded drain if user steps ignore context.
+	activeClaims sync.WaitGroup
 
 	versionMu      sync.Mutex
 	postgresMajor  int
@@ -106,6 +113,10 @@ func New(cfg Config) (*Engine, error) {
 		}
 	}
 
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 	e := &Engine{
 		db:             cfg.DB,
 		schema:         schema,
@@ -117,7 +128,8 @@ func New(cfg Config) (*Engine, error) {
 		heartbeatEvery: heartbeat,
 		eventTTL:       defaultEventTTL,
 		workerID:       newUUID(),
-		workflows:      make(map[string]*compiledWorkflow),
+		workflows:      make(map[workflowKey]*compiledWorkflow),
+		logger:         logger,
 	}
 	return e, nil
 }
@@ -131,30 +143,56 @@ func (e *Engine) Register(wf Workflow) {
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if _, exists := e.workflows[compiled.name]; exists {
-		panic(fmt.Sprintf("durablepg: workflow %q already registered", compiled.name))
+	key := workflowKey{name: compiled.name, version: compiled.version}
+	if _, exists := e.workflows[key]; exists {
+		panic(fmt.Sprintf("durablepg: workflow %q version %d already registered", compiled.name, compiled.version))
 	}
-	e.workflows[compiled.name] = compiled
+	e.workflows[key] = compiled
 }
 
-// RegisterWorkflow registers a workflow using a name and builder function.
+// RegisterWorkflow registers version 1 of a workflow.
 func (e *Engine) RegisterWorkflow(name string, build func(*Builder)) {
 	e.Register(DefineWorkflow(name, build))
 }
 
-func (e *Engine) workflow(name string) (*compiledWorkflow, bool) {
+// RegisterWorkflowVersion registers an immutable version of a workflow.
+func (e *Engine) RegisterWorkflowVersion(name string, version int, build func(*Builder)) {
+	e.Register(DefineWorkflowVersion(name, version, build))
+}
+
+func (e *Engine) workflow(name string, version int) (*compiledWorkflow, bool) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	wf, ok := e.workflows[name]
+	wf, ok := e.workflows[workflowKey{name: name, version: version}]
 	return wf, ok
+}
+
+func (e *Engine) latestWorkflow(name string) (*compiledWorkflow, bool) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	var latest *compiledWorkflow
+	for key, wf := range e.workflows {
+		if key.name == name && (latest == nil || key.version > latest.version) {
+			latest = wf
+		}
+	}
+	return latest, latest != nil
+}
+
+func (e *Engine) supportedWorkflows() ([]string, []int) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	names := make([]string, 0, len(e.workflows))
+	versions := make([]int, 0, len(e.workflows))
+	for key := range e.workflows {
+		names = append(names, key.name)
+		versions = append(versions, key.version)
+	}
+	return names, versions
 }
 
 // Enqueue schedules a workflow run.
 func (e *Engine) Enqueue(ctx context.Context, name string, input any, opts ...EnqueueOption) (WorkflowID, error) {
-	wf, ok := e.workflow(name)
-	if !ok || wf == nil {
-		return "", fmt.Errorf("durablepg: workflow %q is not registered", name)
-	}
 
 	rawInput, err := json.Marshal(input)
 	if err != nil {
@@ -169,6 +207,19 @@ func (e *Engine) Enqueue(ctx context.Context, name string, input any, opts ...En
 		if opt != nil {
 			opt(&o)
 		}
+	}
+	if o.workflowVersion < 0 {
+		return "", fmt.Errorf("durablepg: workflow version must be positive")
+	}
+	var wf *compiledWorkflow
+	var ok bool
+	if o.workflowVersion == 0 {
+		wf, ok = e.latestWorkflow(name)
+	} else {
+		wf, ok = e.workflow(name, o.workflowVersion)
+	}
+	if !ok {
+		return "", fmt.Errorf("durablepg: workflow %q version %d is not registered", name, o.workflowVersion)
 	}
 
 	if strings.TrimSpace(o.queue) == "" {
@@ -189,23 +240,23 @@ func (e *Engine) Enqueue(ctx context.Context, name string, input any, opts ...En
 	var runID string
 	if o.idempotencyKey != "" {
 		query := fmt.Sprintf(`
-INSERT INTO %s (id, workflow_name, queue, state, step_index, attempt, max_attempts, next_run_at, input_json, idempotency_key, created_at, updated_at)
-VALUES ($1, $2, $3, 'ready', 0, 0, $4, $5, $6::jsonb, $7, now(), now())
+INSERT INTO %s (id, workflow_name, workflow_version, queue, state, step_index, attempt, max_attempts, next_run_at, input_json, idempotency_key, created_at, updated_at)
+VALUES ($1, $2, $3, $4, 'ready', 0, 0, $5, $6, $7::jsonb, $8, now(), now())
 ON CONFLICT (workflow_name, idempotency_key)
 WHERE idempotency_key IS NOT NULL
 DO UPDATE SET updated_at = now()
 RETURNING id;
 `, e.table("workflow_runs"))
-		if err := e.db.QueryRow(ctx, query, string(o.runID), wf.name, o.queue, o.maxAttempts, nextRunAt, rawInput, o.idempotencyKey).Scan(&runID); err != nil {
+		if err := e.db.QueryRow(ctx, query, string(o.runID), wf.name, wf.version, o.queue, o.maxAttempts, nextRunAt, rawInput, o.idempotencyKey).Scan(&runID); err != nil {
 			return "", fmt.Errorf("durablepg: enqueue upsert: %w", err)
 		}
 	} else {
 		query := fmt.Sprintf(`
-INSERT INTO %s (id, workflow_name, queue, state, step_index, attempt, max_attempts, next_run_at, input_json, created_at, updated_at)
-VALUES ($1, $2, $3, 'ready', 0, 0, $4, $5, $6::jsonb, now(), now())
+INSERT INTO %s (id, workflow_name, workflow_version, queue, state, step_index, attempt, max_attempts, next_run_at, input_json, created_at, updated_at)
+VALUES ($1, $2, $3, $4, 'ready', 0, 0, $5, $6, $7::jsonb, now(), now())
 RETURNING id;
 `, e.table("workflow_runs"))
-		if err := e.db.QueryRow(ctx, query, string(o.runID), wf.name, o.queue, o.maxAttempts, nextRunAt, rawInput).Scan(&runID); err != nil {
+		if err := e.db.QueryRow(ctx, query, string(o.runID), wf.name, wf.version, o.queue, o.maxAttempts, nextRunAt, rawInput).Scan(&runID); err != nil {
 			return "", fmt.Errorf("durablepg: enqueue insert: %w", err)
 		}
 	}
@@ -262,17 +313,19 @@ WITH awakened AS (
 		last_error = NULL,
 		updated_at = now()
 	WHERE wr.state = 'waiting_event'
+	  AND wr.waiting_event_key = $1
 	  AND wr.id IN (
 		SELECT w.run_id
 		FROM %s w
 		WHERE w.event_key = $1
+		  AND w.run_id = wr.id
 		  AND (w.deadline IS NULL OR w.deadline > now())
 	)
 	RETURNING wr.id
 )
 DELETE FROM %s w
 USING awakened a
-WHERE w.run_id = a.id;
+WHERE w.run_id = a.id AND w.event_key = $1;
 `, e.table("workflow_runs"), e.table("waiters"), e.table("waiters"))
 	if _, err := tx.Exec(ctx, wakeQuery, key); err != nil {
 		return fmt.Errorf("durablepg: wake waiters: %w", err)
@@ -355,6 +408,28 @@ func (e *Engine) endWorker() {
 	e.workerMu.Lock()
 	e.workerRunning = false
 	e.workerMu.Unlock()
+}
+
+// WaitForIdle waits for claims that outlived StartWorker's bounded shutdown.
+// Call it after StartWorker returns and before closing the database pool.
+// A step that ignores cancellation can keep this method waiting indefinitely.
+func (e *Engine) WaitForIdle(ctx context.Context) error {
+	e.workerMu.Lock()
+	defer e.workerMu.Unlock() // Prevent a new worker from adding claims during Wait.
+	if e.workerRunning {
+		return errors.New("durablepg: stop the worker before waiting for idle")
+	}
+	done := make(chan struct{})
+	go func() {
+		e.activeClaims.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func newUUID() string {

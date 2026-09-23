@@ -7,11 +7,62 @@ import (
 	"time"
 )
 
-// ApplySchema creates all durable workflow tables and indexes.
+// ApplySchema advances the schema through ordered, transactional migrations.
+// A pre-versioned installation is treated as version 0; the baseline migration
+// uses idempotent DDL so existing rows are retained.
 func (e *Engine) ApplySchema(ctx context.Context) error {
-	_, err := e.db.Exec(ctx, e.SchemaSQL())
+	tx, err := e.db.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("durablepg: apply schema: %w", err)
+		return fmt.Errorf("durablepg: begin schema migration: %w", err)
+	}
+	defer tx.Rollback(context.Background())
+
+	// Serialize even the first installation, before the migrations table exists.
+	if _, err = tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1))", "durablepg:schema:"+e.schema); err != nil {
+		return fmt.Errorf("durablepg: lock schema migration: %w", err)
+	}
+	if _, err = tx.Exec(ctx, "CREATE SCHEMA IF NOT EXISTS "+e.qSchema); err != nil {
+		return fmt.Errorf("durablepg: create schema: %w", err)
+	}
+	migrations := e.table("schema_migrations")
+	if _, err = tx.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+migrations+" (version INTEGER PRIMARY KEY)"); err != nil {
+		return fmt.Errorf("durablepg: create migration history: %w", err)
+	}
+	migrationSQL := []string{e.schemaBaselineSQL(), e.waitingDeadlineIndexSQL(), e.workflowVersionSQL(), e.selectiveClaimIndexSQL()}
+	rows, err := tx.Query(ctx, "SELECT version FROM "+migrations+" ORDER BY version")
+	if err != nil {
+		return fmt.Errorf("durablepg: read migration history: %w", err)
+	}
+	version := 0
+	for rows.Next() {
+		var recorded int
+		if err = rows.Scan(&recorded); err != nil {
+			break
+		}
+		if recorded != version+1 || recorded > len(migrationSQL) {
+			err = fmt.Errorf("durablepg: unsupported schema migration version %d after %d", recorded, version)
+			break
+		}
+		version = recorded
+	}
+	if err == nil {
+		err = rows.Err()
+	}
+	rows.Close()
+	if err != nil {
+		return fmt.Errorf("durablepg: read migration history: %w", err)
+	}
+	for version < len(migrationSQL) {
+		if _, err = tx.Exec(ctx, migrationSQL[version]); err != nil {
+			return fmt.Errorf("durablepg: apply schema migration %d: %w", version+1, err)
+		}
+		if _, err = tx.Exec(ctx, "INSERT INTO "+migrations+" (version) VALUES ($1)", version+1); err != nil {
+			return fmt.Errorf("durablepg: record schema migration %d: %w", version+1, err)
+		}
+		version++
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return fmt.Errorf("durablepg: commit schema migration: %w", err)
 	}
 	_ = e.postgresVersion(ctx)
 	return nil
@@ -46,8 +97,36 @@ func (e *Engine) Migrate(ctx context.Context) error {
 	return e.ApplySchema(ctx)
 }
 
-// SchemaSQL returns the schema DDL used by ApplySchema.
+// SchemaSQL returns the complete fresh-install DDL, including all migrations.
+// ApplySchema separately records each migration in schema_migrations.
 func (e *Engine) SchemaSQL() string {
+	return e.schemaBaselineSQL() + e.waitingDeadlineIndexSQL() + e.workflowVersionSQL() + e.selectiveClaimIndexSQL()
+}
+
+func (e *Engine) waitingDeadlineIndexSQL() string {
+	return fmt.Sprintf(`
+CREATE INDEX IF NOT EXISTS workflow_runs_waiting_deadline_idx
+	ON %s (waiting_deadline)
+	WHERE state = 'waiting_event';
+`, e.table("workflow_runs"))
+}
+
+func (e *Engine) workflowVersionSQL() string {
+	return fmt.Sprintf(`
+ALTER TABLE %s ADD COLUMN IF NOT EXISTS workflow_version INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE %s ADD COLUMN IF NOT EXISTS lease_failures INTEGER NOT NULL DEFAULT 0;
+`, e.table("workflow_runs"), e.table("workflow_runs")) + e.partitionFunctionsSQL()
+}
+
+func (e *Engine) selectiveClaimIndexSQL() string {
+	return fmt.Sprintf(`
+CREATE INDEX IF NOT EXISTS workflow_runs_selective_ready_idx
+	ON %s (queue, workflow_name, workflow_version, next_run_at, id)
+	WHERE state = 'ready';
+`, e.table("workflow_runs"))
+}
+
+func (e *Engine) schemaBaselineSQL() string {
 	return fmt.Sprintf(`
 CREATE SCHEMA IF NOT EXISTS %[1]s;
 
@@ -124,33 +203,6 @@ CREATE INDEX IF NOT EXISTS event_log_expires_idx
 CREATE INDEX IF NOT EXISTS waiters_deadline_idx
 	ON %[5]s (deadline);
 
-CREATE OR REPLACE FUNCTION %[1]s.ensure_event_log_partitions(months_ahead INT DEFAULT 3)
-RETURNS void AS $fn$
-DECLARE
-	partition_date DATE;
-	partition_name TEXT;
-	start_bound TIMESTAMPTZ;
-	end_bound TIMESTAMPTZ;
-BEGIN
-	FOR i IN 0..months_ahead LOOP
-		partition_date := date_trunc('month', CURRENT_DATE + (i || ' months')::interval);
-		partition_name := 'event_log_' || to_char(partition_date, 'YYYYMM');
-		start_bound := partition_date;
-		end_bound := partition_date + '1 month'::interval;
-
-		IF NOT EXISTS (
-			SELECT 1 FROM pg_class c
-			JOIN pg_namespace n ON n.oid = c.relnamespace
-			WHERE n.nspname = '%[7]s' AND c.relname = partition_name
-		) THEN
-			EXECUTE format(
-				'CREATE TABLE %%I.%%I PARTITION OF %%I.event_log FOR VALUES FROM (%%L) TO (%%L)',
-				'%[7]s', partition_name, '%[7]s', start_bound, end_bound
-			);
-		END IF;
-	END LOOP;
-END;
-$fn$ LANGUAGE plpgsql;
 `,
 		e.qSchema,
 		e.table("workflow_runs"),
@@ -158,11 +210,102 @@ $fn$ LANGUAGE plpgsql;
 		e.table("event_log"),
 		e.table("waiters"),
 		e.table("event_log_default"),
+	) + e.partitionFunctionsSQL()
+}
+
+func (e *Engine) partitionFunctionsSQL() string {
+	return fmt.Sprintf(`
+-- A common path keeps function-driven and generated partition DDL equivalent.
+-- Parent and default locks exclude both routed and direct writes while rows
+-- are moved; a failure rolls the entire move and partition creation back.
+CREATE OR REPLACE FUNCTION %[1]s.create_event_log_partition(start_bound TIMESTAMPTZ, end_bound TIMESTAMPTZ)
+RETURNS void AS $fn$
+DECLARE
+	partition_name TEXT := 'event_log_' || to_char(start_bound AT TIME ZONE 'UTC', 'YYYYMM');
+BEGIN
+	-- A catalog check avoids table-wide locks for the usual already-created month.
+	-- The locked check below handles concurrent creators.
+	IF EXISTS (
+		SELECT 1 FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		JOIN pg_inherits inh ON inh.inhrelid = c.oid
+		WHERE n.nspname = '%[4]s' AND c.relname = partition_name
+		  AND inh.inhparent = '%[2]s'::regclass
+	) THEN
+		RETURN;
+	END IF;
+
+	LOCK TABLE %[2]s IN ACCESS EXCLUSIVE MODE;
+	LOCK TABLE %[3]s IN ACCESS EXCLUSIVE MODE;
+	IF EXISTS (
+		SELECT 1 FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		JOIN pg_inherits inh ON inh.inhrelid = c.oid
+		WHERE n.nspname = '%[4]s' AND c.relname = partition_name
+		  AND inh.inhparent = '%[2]s'::regclass
+	) THEN
+		RETURN;
+	END IF;
+
+	-- DDL cannot carve a range out of a populated default partition. Staging
+	-- in a transaction-local table preserves identity values and all row data.
+	CREATE TEMP TABLE durablepg_repartition_rows ON COMMIT DROP AS
+		SELECT id, event_key, payload_json, created_at, expires_at
+		FROM %[3]s WITH NO DATA;
+	WITH moved AS (
+		DELETE FROM %[3]s
+		WHERE created_at >= start_bound AND created_at < end_bound
+		RETURNING id, event_key, payload_json, created_at, expires_at
+	)
+	INSERT INTO pg_temp.durablepg_repartition_rows
+	SELECT * FROM moved;
+	EXECUTE format(
+		'CREATE TABLE %%I.%%I PARTITION OF %%I.event_log FOR VALUES FROM (%%L) TO (%%L)',
+		'%[4]s', partition_name, '%[4]s', start_bound, end_bound
+	);
+	INSERT INTO %[2]s (id, event_key, payload_json, created_at, expires_at)
+		OVERRIDING SYSTEM VALUE
+		SELECT id, event_key, payload_json, created_at, expires_at
+		FROM pg_temp.durablepg_repartition_rows;
+	DROP TABLE pg_temp.durablepg_repartition_rows;
+END;
+$fn$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION %[1]s.ensure_event_log_partitions(months_ahead INT DEFAULT 3)
+RETURNS void AS $fn$
+DECLARE
+	partition_date DATE;
+	start_bound TIMESTAMPTZ;
+BEGIN
+	FOR i IN 0..months_ahead LOOP
+		partition_date := date_trunc('month', now() AT TIME ZONE 'UTC')::date + make_interval(months => i);
+		start_bound := partition_date::timestamp AT TIME ZONE 'UTC';
+		IF NOT EXISTS (
+			SELECT 1 FROM pg_class c
+			JOIN pg_namespace n ON n.oid = c.relnamespace
+			JOIN pg_inherits inh ON inh.inhrelid = c.oid
+			WHERE n.nspname = '%[4]s'
+			  AND c.relname = 'event_log_' || to_char(start_bound AT TIME ZONE 'UTC', 'YYYYMM')
+			  AND inh.inhparent = '%[2]s'::regclass
+		) THEN
+			PERFORM %[1]s.create_event_log_partition(
+				start_bound,
+				(partition_date + INTERVAL '1 month')::timestamp AT TIME ZONE 'UTC'
+			);
+		END IF;
+	END LOOP;
+END;
+$fn$ LANGUAGE plpgsql;
+`,
+		e.qSchema,
+		e.table("event_log"),
+		e.table("event_log_default"),
 		e.schema,
 	)
 }
 
-// EventLogMonthlyPartitionsSQL returns DDL to create monthly event_log partitions.
+// EventLogMonthlyPartitionsSQL returns calls to the same transactional helper
+// used by EnsurePartitions. Execute the DDL only after applying the schema.
 func (e *Engine) EventLogMonthlyPartitionsSQL(from time.Time, months int) (string, error) {
 	if months <= 0 {
 		return "", nil
@@ -170,15 +313,11 @@ func (e *Engine) EventLogMonthlyPartitionsSQL(from time.Time, months int) (strin
 	from = time.Date(from.Year(), from.Month(), 1, 0, 0, 0, 0, time.UTC)
 
 	var ddl strings.Builder
-	for i := 0; i < months; i++ {
+	for i := range months {
 		start := from.AddDate(0, i, 0)
 		end := start.AddDate(0, 1, 0)
-		name := fmt.Sprintf("event_log_%04d%02d", start.Year(), int(start.Month()))
-		stmt := fmt.Sprintf(`
-CREATE TABLE IF NOT EXISTS %s
-PARTITION OF %s
-FOR VALUES FROM (%s) TO (%s);
-`, e.table(name), e.table("event_log"), pgTimestampLiteral(start), pgTimestampLiteral(end))
+		stmt := fmt.Sprintf("SELECT %s.create_event_log_partition(%s, %s);\n",
+			e.qSchema, pgTimestampLiteral(start), pgTimestampLiteral(end))
 		ddl.WriteString(stmt)
 	}
 	return ddl.String(), nil

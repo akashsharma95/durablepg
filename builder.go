@@ -30,7 +30,29 @@ type stepOp struct {
 
 type waitEventOp struct {
 	key     string
+	keyFn   func(*StepContext) (string, error)
 	timeout time.Duration
+}
+
+func (op *waitEventOp) resolve(sc *StepContext) (key string, err error) {
+	if op.keyFn != nil {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				err = fmt.Errorf("durablepg: event key resolver panicked: %v", recovered)
+			}
+		}()
+		key, err = op.keyFn(sc)
+		if err != nil {
+			return "", err
+		}
+	} else {
+		key = op.key
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return "", errors.New("durablepg: resolved event key is required")
+	}
+	return key, nil
 }
 
 // Builder records a workflow definition.
@@ -104,17 +126,39 @@ func (b *Builder) WaitEvent(key string, timeout time.Duration) {
 	})
 }
 
+// WaitEventFunc resolves a run-specific event key from its input and prior steps.
+// The resolver may be called again after a retry; it must be deterministic.
+func (b *Builder) WaitEventFunc(keyFn func(*StepContext) (string, error), timeout time.Duration) {
+	if b == nil {
+		panic("durablepg: nil builder")
+	}
+	if keyFn == nil {
+		panic("durablepg: event key resolver is required")
+	}
+	if timeout <= 0 {
+		panic("durablepg: wait event timeout must be > 0")
+	}
+	b.ops = append(b.ops, operation{
+		kind: opWaitEvent,
+		wait: &waitEventOp{keyFn: keyFn, timeout: timeout},
+	})
+}
+
 type compiledWorkflow struct {
-	name string
-	ops  []operation
+	name    string
+	version int
+	ops     []operation
 }
 
 type workflowDefinition struct {
-	name  string
-	build func(*Builder)
+	name    string
+	version int
+	build   func(*Builder)
 }
 
 func (wf workflowDefinition) Name() string { return wf.name }
+
+func (wf workflowDefinition) Version() int { return wf.version }
 
 func (wf workflowDefinition) Build(b *Builder) {
 	if wf.build != nil {
@@ -122,9 +166,15 @@ func (wf workflowDefinition) Build(b *Builder) {
 	}
 }
 
-// DefineWorkflow creates a workflow from a name and builder function.
+// DefineWorkflow creates version 1 of a workflow from a name and builder function.
 func DefineWorkflow(name string, build func(*Builder)) Workflow {
-	return workflowDefinition{name: name, build: build}
+	return DefineWorkflowVersion(name, 1, build)
+}
+
+// DefineWorkflowVersion creates a workflow definition with an immutable version.
+// Keep earlier versions registered while their runs are still active.
+func DefineWorkflowVersion(name string, version int, build func(*Builder)) Workflow {
+	return workflowDefinition{name: name, version: version, build: build}
 }
 
 func compileWorkflow(wf Workflow) (*compiledWorkflow, error) {
@@ -135,6 +185,13 @@ func compileWorkflow(wf Workflow) (*compiledWorkflow, error) {
 	if name == "" {
 		return nil, errors.New("workflow name is required")
 	}
+	version := 1
+	if versioned, ok := wf.(interface{ Version() int }); ok {
+		version = versioned.Version()
+	}
+	if version < 1 {
+		return nil, fmt.Errorf("workflow %q version must be positive", name)
+	}
 
 	b := &Builder{stepNames: make(map[string]struct{})}
 	wf.Build(b)
@@ -144,5 +201,5 @@ func compileWorkflow(wf Workflow) (*compiledWorkflow, error) {
 
 	ops := make([]operation, len(b.ops))
 	copy(ops, b.ops)
-	return &compiledWorkflow{name: name, ops: ops}, nil
+	return &compiledWorkflow{name: name, version: version, ops: ops}, nil
 }
