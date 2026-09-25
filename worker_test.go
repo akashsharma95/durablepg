@@ -19,8 +19,9 @@ func TestResolveWaitKeyUsesCurrentRunAndCompletedValues(t *testing.T) {
 		if _, err := sc.Value("lookup", &previous); err != nil {
 			return "", err
 		}
-		// Mutating a resolver's view must not mutate the active run's values.
-		sc.values["lookup"][0] = '!'
+		// Mutating a publicly returned value must not change later steps.
+		raw, _ := sc.RawValue("lookup")
+		raw[0] = '!'
 		return string(sc.RunID) + ":" + sc.Workflow + ":" + input.Order + ":" + previous.Region, nil
 	}}
 	for _, tc := range []struct {

@@ -127,6 +127,80 @@ func BenchmarkE2ESingleStep(b *testing.B) {
 	}
 }
 
+// These two completion benchmarks include enqueue, worker execution, and the
+// final completion poll in workflows/s. enqueue-runs/s excludes the drain wait;
+// allocations include both the producer and workers. Results depend on the
+// PostgreSQL host, pool contention, and polling cadence, not just step code.
+func BenchmarkE2ETenSteps(b *testing.B) {
+	h := newBenchmarkHarness(b, "e2e_ten_steps", max(1, runtime.GOMAXPROCS(0)))
+	h.engine.RegisterWorkflow("ten_steps_bench", func(wf *Builder) {
+		for i := range 10 {
+			wf.Step(fmt.Sprintf("step_%02d", i+1), func(context.Context, *StepContext) (any, error) {
+				return true, nil
+			})
+		}
+	})
+
+	benchmarkE2ECompletion(b, h, "ten_steps_bench")
+}
+
+func BenchmarkE2ETenLargeStepResults(b *testing.B) {
+	h := newBenchmarkHarness(b, "e2e_ten_large_results", max(1, runtime.GOMAXPROCS(0)))
+	result := strings.Repeat("x", 64<<10)
+	h.engine.RegisterWorkflow("ten_large_results_bench", func(wf *Builder) {
+		for i := range 10 {
+			wf.Step(fmt.Sprintf("persist_%02d", i+1), func(context.Context, *StepContext) (any, error) {
+				return result, nil
+			})
+		}
+	})
+
+	benchmarkE2ECompletion(b, h, "ten_large_results_bench")
+}
+
+func benchmarkE2ECompletion(b *testing.B, h *benchmarkHarness, workflow string) {
+	b.Helper()
+	h.startWorker(b)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	started := time.Now()
+
+	var once sync.Once
+	var benchErr error
+	var enqueued atomic.Int64
+	var failed atomic.Bool
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if failed.Load() {
+				return
+			}
+			if _, err := h.engine.Run(context.Background(), workflow, map[string]any{"n": 1}); err != nil {
+				once.Do(func() {
+					benchErr = err
+					failed.Store(true)
+				})
+				return
+			}
+			enqueued.Add(1)
+		}
+	})
+	enqueueElapsed := time.Since(started)
+	if benchErr != nil {
+		b.StopTimer()
+		b.Fatalf("%s enqueue failed: %v", workflow, benchErr)
+	}
+
+	if err := h.waitForCompletedRuns(b, int(enqueued.Load()), 60*time.Second); err != nil {
+		b.StopTimer()
+		b.Fatalf("%s did not finish: %v", workflow, err)
+	}
+	b.StopTimer()
+	completionElapsed := time.Since(started)
+	b.ReportMetric(float64(enqueued.Load())/enqueueElapsed.Seconds(), "enqueue-runs/s")
+	b.ReportMetric(float64(enqueued.Load())/completionElapsed.Seconds(), "workflows/s")
+}
+
 func BenchmarkE2EEventWakeLatency(b *testing.B) {
 	h := newBenchmarkHarness(b, "e2e_event_wake", max(1, runtime.GOMAXPROCS(0)))
 	const eventKey = "event_wake_bench"

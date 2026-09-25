@@ -135,6 +135,8 @@ A timeout also advances to the next operation. If that operation requires paymen
 
 `Run(ctx, name, input, options...)` inserts a `ready` run and returns its ID. `Enqueue` is equivalent. Useful options include `WithScheduledAt`, `WithQueue`, `WithMaxAttempts`, `WithWorkflowVersion`, and `WithDeduplicationKey`.
 
+Without an explicit ID, `Run` generates one locally before inserting; it does not query PostgreSQL to generate an ID. `EmitEvent` and waiter registration serialize by schema and event key so an event published during registration is not lost if the worker stops before its post-commit recheck. Use `EmitEvent` rather than inserting event rows directly for reliable wakeups.
+
 Without an explicit version, `Run` chooses the highest version registered **on that engine**. A worker claims only `(name, version)` pairs it has registered:
 
 ```go
@@ -161,6 +163,8 @@ The principal tables are `workflow_runs` (state, input, due time, version, lease
 
 `Init` is safe to repeat. Existing event partitions avoid an exclusive table lock, but creating a missing month can take one while moving matching rows out of the default partition. Pre-create future ranges. Workers delete expired events in bounded batches; they do **not** automatically drop old partitions, which can contain events with no expiration. Plan retention around your event volume and monitor overdue `ready` runs, `waiting_event` deadlines, failed runs, and pool pressure.
 
+Completed/failed runs and checkpoints have no automatic TTL. Deleting a run also forgets its deduplication key; set a retention policy that accounts for late producer retries before purging history. Before retiring a workflow version, drain or keep a compatible worker for its nonterminal runs. After restoring a database backup, reconcile external effects performed after the backup and ensure their idempotency keys remain valid before restarting workers. See [operational limits](ARCHITECTURE.md#operational-signals-and-limits) for pool, backlog, recovery, and retention guidance.
+
 ## Benchmarks
 
 The repository's benchmarks use a real PostgreSQL instance and isolated databases via `pgtestdb`. A paired local run on an Apple M5 Max, PostgreSQL 17 in Podman, `GOMAXPROCS=4`, and `-benchtime=100x -count=1` produced:
@@ -172,14 +176,50 @@ The repository's benchmarks use a real PostgreSQL instance and isolated database
 | One-step completion, four slots | 409.3 workflows/s | 1,116 workflows/s |
 | Event wake-to-completion | 6,709 µs | 7,229 µs |
 
-The wake path was slower in this sample. Single-pass local numbers are comparisons, not a capacity promise. To repeat the same command, provide a disposable PostgreSQL 17 database as `DURABLEPG_TEST_DATABASE_URL`:
+The wake path was slower in that historical sample. Single-pass local numbers are comparisons, not a capacity promise.
+
+The following comparison uses isolated PostgreSQL 18.6 Podman databases on the same host with `GOMAXPROCS=4` and `-benchtime=1000x`. The earlier implementation was run three times; the current implementation twice:
+
+| Workload | Earlier range | Current range |
+| --- | ---: | ---: |
+| Enqueue | 3,338–3,487 runs/s | 6,381–6,747 runs/s |
+| One-step completion, one slot | 815–867 workflows/s | 1,085–1,089 workflows/s |
+| One-step completion, four slots | 1,512–1,540 workflows/s | 2,056–2,135 workflows/s |
+| Event wake-to-completion | 7,159–7,202 µs | 7,278–7,323 µs |
+
+Event wake latency did **not** improve in this sample. Two additional current-only workloads at `-benchtime=100x -count=2` measured 677–681 workflows/s for ten short steps and 88.9–92.9 workflows/s for ten 64 KiB step results (four slots).
+
+The ten-step benchmarks include enqueue and drain to completion; their `enqueue-runs/s` metric excludes the drain, while `workflows/s` includes it. Each benchmark uses a fresh disposable database. Short samples, local database latency, and a 5 ms event-state polling interval limit interpretation; repeat against representative payloads, database latency, concurrency, and retention before setting production capacity limits.
+
+To repeat the current workload matrix, provide a disposable PostgreSQL database as `DURABLEPG_TEST_DATABASE_URL`:
 
 ```bash
 GOMAXPROCS=4 DURABLEPG_TEST_DATABASE_URL='postgres://postgres:localtest@127.0.0.1:55432/durablepg?sslmode=disable' \
-go test -run '^$' -bench 'Benchmark(Enqueue|E2ESingleStep|E2EEventWakeLatency)$' -benchtime=100x -count=1
+go test -run '^$' -bench 'Benchmark(Enqueue|E2ESingleStep|E2ETenSteps|E2ETenLargeStepResults|E2EEventWakeLatency)$' -benchtime=100x -count=2
 ```
 
 The integration tests also use `DURABLEPG_TEST_DATABASE_URL`; without it, they skip PostgreSQL-specific cases.
+
+For retention and vacuum behavior, `go run ./cmd/growthbench` uses a **fresh, disposable PostgreSQL 18 database** (with permission to install `pgstattuple`). It refuses an existing `growthbench` schema. Run the two profiles on separate, otherwise identical databases, one at a time:
+
+```bash
+DURABLEPG_GROWTH_DATABASE_URL='postgres://postgres:localtest@127.0.0.1:55432/postgres?sslmode=disable' \
+go run ./cmd/growthbench -profile=default -stage=45s -rate=100 -active=64 -history=0,100000,300000
+# Point the same command at a different fresh database for -profile=tuned.
+```
+
+The workload holds 64 long claims at the default 10-second heartbeat, enqueues 100 real short workflows per second, and adds terminal runs plus checkpoints at each history milestone. `tuned` tests per-table `autovacuum_vacuum_scale_factor=0.005`, `autovacuum_vacuum_threshold=200`, and `vacuum_index_cleanup=on`; it is an experimental comparison, **not** a production setting. Output includes productive claim-query p50/p95/p99, claim/recovery buffer probes, physical dead tuples, relation sizes, per-run-table autovacuum count/time, cluster-wide autovacuum relation I/O, total WAL bytes, and pool waits. Synthetic history isolates the effect of retained rows; the short workflows generate real claim/checkpoint/finish updates. Short local runs do not establish cold-cache or long-term production performance.
+
+One paired local PostgreSQL 18.6 Podman run, using fresh containers per profile and 45-second stages, measured:
+
+| Retained terminal runs | Default claim p95 | Tuned claim p95 | Default / tuned run-table autovacuums |
+| ---: | ---: | ---: | ---: |
+| 0 | 1.04 ms | 1.01 ms | 0 / 0 |
+| 100,000 | 1.02 ms | 1.03 ms | 1 / 1 |
+| 300,000 | 1.05 ms | 1.04 ms | 2 / 2 |
+| 1,000,000 | 1.03 ms | 1.07 ms | 0 / 1 |
+
+The million-row profiles were separate 0→1,000,000 runs. At that milestone, the default profile had 5,418 dead leased-index entries and its expired-lease probe hit 94 buffers; the tuned profile had 1,252 dead entries but hit 191 buffers. Tuned vacuum spent 5.2 seconds on `workflow_runs` and scanned all 19,437 heap pages after the large insert. Cluster-wide autovacuum relation reads/writes were 128/78 MiB with defaults versus 310/165 MiB tuned; these I/O totals also include other tables. Neither profile showed a meaningful claim-latency regression through one million retained runs, and these data do **not** justify the tested vacuum override or active/history separation. Single runs, synthetic history, local caches, and the brief duration limit that conclusion.
 
 ## License
 

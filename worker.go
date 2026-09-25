@@ -54,6 +54,7 @@ func (e *Engine) StartWorker(ctx context.Context) error {
 		g.Go(func() error { return e.listenLoop(dispatchCtx, wake) })
 	}
 	g.Go(func() error { return e.maintenanceLoop(dispatchCtx) })
+	g.Go(func() error { return e.retentionLoop(dispatchCtx) })
 	g.Go(func() error { return e.dispatchLoop(dispatchCtx, workCtx, cancelWork, wake) })
 	return g.Wait()
 }
@@ -110,13 +111,11 @@ func (e *Engine) listenLoop(ctx context.Context, wake chan<- struct{}) error {
 	}
 }
 
-// maintenanceLoop keeps recovery and retention off the latency-sensitive
-// dispatcher. Both paths use bounded database batches.
+// maintenanceLoop recovers leases and waits independently of event retention.
 func (e *Engine) maintenanceLoop(ctx context.Context) error {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-	pruneTicker := time.NewTicker(time.Minute)
-	defer pruneTicker.Stop()
+	// Retention has its own loop so a large prune cannot defer recovery.
 	maintain := func() {
 		if err := e.recoverExpiredLeases(ctx); err != nil && ctx.Err() == nil {
 			e.logger.Error("recover expired workflow leases", "error", err)
@@ -132,7 +131,18 @@ func (e *Engine) maintenanceLoop(ctx context.Context) error {
 			return nil
 		case <-ticker.C:
 			maintain()
-		case <-pruneTicker.C:
+		}
+	}
+}
+
+func (e *Engine) retentionLoop(ctx context.Context) error {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
 			if err := e.pruneExpiredEvents(ctx); err != nil && ctx.Err() == nil {
 				e.logger.Error("prune expired workflow events", "error", err)
 			}
@@ -465,12 +475,12 @@ func (e *Engine) runStep(ctx context.Context, run claimedRun, index int, step *s
 	if err != nil {
 		return fmt.Errorf("durablepg: marshal step %q output: %w", step.name, err)
 	}
-	raw, err = e.persistCheckpoint(execCtx, run, stepKey, raw)
+	raw, err = e.commitStep(execCtx, run, index, stepKey, raw)
 	if err != nil {
 		return err
 	}
 	values[step.name] = raw
-	return e.advanceStep(ctx, run, index+1)
+	return nil
 }
 
 func (e *Engine) advanceStep(ctx context.Context, run claimedRun, nextIndex int) error {
@@ -540,6 +550,26 @@ func (e *Engine) parkForEvent(ctx context.Context, run claimedRun, nextIndex int
 		return false, fmt.Errorf("durablepg: begin wait tx: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	// Serialize event publication and waiter registration for this key.
+	// The existence check must run after acquiring the lock, in a fresh
+	// READ COMMITTED statement, so a published event or a committed waiter
+	// is always visible to one side of the protocol.
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1::text), hashtext($2::text))", e.schema, key); err != nil {
+		return false, fmt.Errorf("durablepg: lock event key: %w", err)
+	}
+	query := fmt.Sprintf(`SELECT EXISTS (
+	SELECT 1 FROM %s
+	WHERE event_key = $1 AND (expires_at IS NULL OR expires_at > now())
+);`, e.table("event_log"))
+	if err := tx.QueryRow(ctx, query, key).Scan(&exists); err != nil {
+		return false, fmt.Errorf("durablepg: recheck event under lock: %w", err)
+	}
+	if exists {
+		if err := tx.Commit(ctx); err != nil {
+			return false, fmt.Errorf("durablepg: commit event check: %w", err)
+		}
+		return false, e.advanceStep(ctx, run, nextIndex)
+	}
 
 	insertWaiter := fmt.Sprintf(`
 INSERT INTO %s (event_key, run_id, deadline, created_at)
@@ -634,76 +664,57 @@ WHERE run_id = $1
 
 func (e *Engine) eventExists(ctx context.Context, key string) (bool, error) {
 	query := fmt.Sprintf(`
-SELECT payload_json
-FROM %s
-WHERE event_key = $1
-  AND (expires_at IS NULL OR expires_at > now())
-ORDER BY created_at DESC
-LIMIT 1;
-`, e.table("event_log"))
-	var raw []byte
-	err := e.db.QueryRow(ctx, query, key).Scan(&raw)
-	if err == nil {
-		return true, nil
+SELECT EXISTS (
+	SELECT 1 FROM %s
+	WHERE event_key = $1 AND (expires_at IS NULL OR expires_at > now())
+);`, e.table("event_log"))
+	var exists bool
+	if err := e.db.QueryRow(ctx, query, key).Scan(&exists); err != nil {
+		return false, fmt.Errorf("durablepg: lookup event: %w", err)
 	}
-	if isNoRows(err) {
-		return false, nil
-	}
-	return false, fmt.Errorf("durablepg: lookup event: %w", err)
+	return exists, nil
 }
 
-func (e *Engine) lookupCheckpoint(ctx context.Context, runID WorkflowID, stepKey string) (json.RawMessage, bool, error) {
+// commitStep locks the claim, saves the first result, and advances progress in
+// one statement. A checkpoint from an older worker may already exist at this
+// cursor; its value wins, including when a previous commit response was lost.
+func (e *Engine) commitStep(ctx context.Context, run claimedRun, index int, stepKey string, value []byte) (json.RawMessage, error) {
 	query := fmt.Sprintf(`
-SELECT value_json
-FROM %s
-WHERE run_id = $1
-  AND step_key = $2;
-`, e.table("step_checkpoints"))
-	var raw []byte
-	err := e.db.QueryRow(ctx, query, string(runID), stepKey).Scan(&raw)
-	if err == nil {
-		cp := make([]byte, len(raw))
-		copy(cp, raw)
-		return cp, true, nil
-	}
-	if isNoRows(err) {
-		return nil, false, nil
-	}
-	return nil, false, fmt.Errorf("durablepg: lookup checkpoint: %w", err)
-}
-
-func (e *Engine) persistCheckpoint(ctx context.Context, run claimedRun, stepKey string, value []byte) (json.RawMessage, error) {
-	// Lock the run row so recovery/reclaim cannot interleave between checking
-	// ownership and inserting the checkpoint. ON CONFLICT preserves the first
-	// completed result after a retry.
-	insert := fmt.Sprintf(`
-WITH owned AS (
+WITH owned AS MATERIALIZED (
 	SELECT id FROM %s
-	WHERE id = $1 AND state = 'leased'
-	  AND lease_owner = $4 AND lease_until > clock_timestamp()
+	WHERE id = $1 AND state = 'leased' AND lease_owner = $4
+	  AND lease_until > clock_timestamp() AND step_index = $5
 	FOR UPDATE
+), inserted AS (
+	INSERT INTO %s (run_id, step_key, value_json, completed_at)
+	SELECT id, $2, $3::jsonb, now() FROM owned
+	ON CONFLICT (run_id, step_key) DO NOTHING
+	RETURNING value_json
+), recorded AS (
+	SELECT value_json FROM inserted
+	UNION ALL
+	SELECT value_json FROM %s
+	WHERE run_id = $1 AND step_key = $2
+	  AND NOT EXISTS (SELECT 1 FROM inserted)
+), advanced AS (
+	UPDATE %s wr
+	SET step_index = $5 + 1, updated_at = now(),
+	    last_error = NULL, lease_failures = 0
+	FROM owned
+	WHERE wr.id = owned.id AND EXISTS (SELECT 1 FROM recorded)
+	RETURNING wr.id
 )
-INSERT INTO %s (run_id, step_key, value_json, completed_at)
-SELECT id, $2, $3::jsonb, now() FROM owned WHERE true
-ON CONFLICT (run_id, step_key) DO NOTHING;
-`, e.table("workflow_runs"), e.table("step_checkpoints"))
-	tag, err := e.db.Exec(ctx, insert, string(run.ID), stepKey, value, run.LeaseOwner)
-	if err != nil {
-		return nil, fmt.Errorf("durablepg: insert checkpoint: %w", err)
-	}
-	if tag.RowsAffected() > 0 {
-		cp := make([]byte, len(value))
-		copy(cp, value)
-		return cp, nil
-	}
-	existing, found, err := e.lookupCheckpoint(ctx, run.ID, stepKey)
-	if err != nil {
-		return nil, err
-	}
-	if !found {
+SELECT value_json FROM recorded WHERE EXISTS (SELECT 1 FROM advanced);
+`, e.table("workflow_runs"), e.table("step_checkpoints"), e.table("step_checkpoints"), e.table("workflow_runs"))
+	var saved []byte
+	err := e.db.QueryRow(ctx, query, string(run.ID), stepKey, value, run.LeaseOwner, index).Scan(&saved)
+	if isNoRows(err) {
 		return nil, errLostLease
 	}
-	return existing, nil
+	if err != nil {
+		return nil, fmt.Errorf("durablepg: commit step: %w", err)
+	}
+	return saved, nil
 }
 
 func (e *Engine) loadStepValues(ctx context.Context, runID WorkflowID) (map[string]json.RawMessage, error) {
@@ -827,7 +838,7 @@ func (e *Engine) recoverExpiredLeases(ctx context.Context) error {
 WITH picked AS (
 	SELECT id
 	FROM %s
-	WHERE state = 'leased' AND lease_until < clock_timestamp()
+	WHERE state = 'leased' AND lease_until < statement_timestamp()
 	ORDER BY lease_until, id
 	LIMIT 1024
 	FOR UPDATE SKIP LOCKED
@@ -844,12 +855,22 @@ SET state = CASE WHEN wr.lease_failures + 1 >= wr.max_attempts OR wr.attempt >= 
 FROM picked
 WHERE wr.id = picked.id;
 `, e.table("workflow_runs"), e.table("workflow_runs"))
-	tag, err := e.db.Exec(ctx, query)
-	if err != nil {
-		return fmt.Errorf("durablepg: recover leases: %w", err)
-	}
-	if tag.RowsAffected() > 0 {
-		e.notifyWakeup(ctx, e.queue)
+	started := time.Now()
+	woke := false
+	defer func() {
+		if woke {
+			e.notifyWakeup(ctx, e.queue)
+		}
+	}()
+	for range 8 {
+		tag, err := e.db.Exec(ctx, query)
+		if err != nil {
+			return fmt.Errorf("durablepg: recover leases: %w", err)
+		}
+		woke = woke || tag.RowsAffected() > 0
+		if tag.RowsAffected() < 1024 || time.Since(started) >= time.Second {
+			break
+		}
 	}
 	return nil
 }
@@ -859,7 +880,7 @@ func (e *Engine) promoteTimedOutWaiters(ctx context.Context) error {
 WITH picked AS (
 	SELECT id
 	FROM %s
-	WHERE state = 'waiting_event' AND waiting_deadline <= clock_timestamp()
+	WHERE state = 'waiting_event' AND waiting_deadline <= statement_timestamp()
 	ORDER BY waiting_deadline, id
 	LIMIT 1024
 	FOR UPDATE SKIP LOCKED
@@ -879,12 +900,22 @@ WITH picked AS (
 )
 SELECT count(*) FROM promoted;
 `, e.table("workflow_runs"), e.table("workflow_runs"), e.table("waiters"))
-	var count int
-	if err := e.db.QueryRow(ctx, query).Scan(&count); err != nil {
-		return fmt.Errorf("durablepg: promote waiters: %w", err)
-	}
-	if count > 0 {
-		e.notifyWakeup(ctx, e.queue)
+	started := time.Now()
+	woke := false
+	defer func() {
+		if woke {
+			e.notifyWakeup(ctx, e.queue)
+		}
+	}()
+	for range 8 {
+		var count int
+		if err := e.db.QueryRow(ctx, query).Scan(&count); err != nil {
+			return fmt.Errorf("durablepg: promote waiters: %w", err)
+		}
+		woke = woke || count > 0
+		if count < 1024 || time.Since(started) >= time.Second {
+			break
+		}
 	}
 
 	// Remove orphaned expired registrations left by earlier, non-atomic wakes.
@@ -893,7 +924,7 @@ SELECT count(*) FROM promoted;
 WITH expired AS (
 	SELECT w.event_key, w.run_id
 	FROM %s w
-	WHERE w.deadline <= clock_timestamp()
+	WHERE w.deadline <= statement_timestamp()
 	ORDER BY w.deadline, w.run_id
 	LIMIT 1024
 	FOR UPDATE OF w SKIP LOCKED
@@ -907,8 +938,14 @@ WHERE w.event_key = x.event_key AND w.run_id = x.run_id
 	  AND wr.waiting_deadline IS NOT DISTINCT FROM w.deadline
   );
 `, e.table("waiters"), e.table("waiters"), e.table("workflow_runs"))
-	if _, err := e.db.Exec(ctx, cleanup); err != nil {
-		return fmt.Errorf("durablepg: cleanup stale waiters: %w", err)
+	for range 8 {
+		tag, err := e.db.Exec(ctx, cleanup)
+		if err != nil {
+			return fmt.Errorf("durablepg: cleanup stale waiters: %w", err)
+		}
+		if tag.RowsAffected() < 1024 || time.Since(started) >= time.Second {
+			break
+		}
 	}
 	return nil
 }
@@ -918,7 +955,7 @@ func (e *Engine) pruneExpiredEvents(ctx context.Context) error {
 WITH expired AS (
 	SELECT tableoid, ctid
 	FROM %s
-	WHERE expires_at <= clock_timestamp()
+	WHERE expires_at <= statement_timestamp()
 	ORDER BY expires_at
 	LIMIT 2048
 	FOR UPDATE SKIP LOCKED
@@ -926,14 +963,15 @@ WITH expired AS (
 DELETE FROM %s ev USING expired
 WHERE ev.tableoid = expired.tableoid AND ev.ctid = expired.ctid;
 `, e.table("event_log"), e.table("event_log"))
-	// Retention must keep pace with event volume without one unbounded DELETE.
-	// Limit each sweep so claim and wake queries retain access to the pool.
+	// Keep each sweep bounded even if expired events are arriving faster than
+	// deletion; lease renewals share this pool.
+	started := time.Now()
 	for range 64 {
 		tag, err := e.db.Exec(ctx, query)
 		if err != nil {
 			return fmt.Errorf("durablepg: prune events: %w", err)
 		}
-		if tag.RowsAffected() < 2048 {
+		if tag.RowsAffected() < 2048 || time.Since(started) >= time.Second {
 			return nil
 		}
 	}
@@ -967,12 +1005,13 @@ func stepName(stepKey string) string {
 	return parts[1]
 }
 
+// Checkpoint result bytes are immutable after insertion into values. A fresh
+// map keeps retained StepContexts from seeing later steps; RawValue still
+// returns a defensive copy to callers.
 func cloneValues(in map[string]json.RawMessage) map[string]json.RawMessage {
 	out := make(map[string]json.RawMessage, len(in))
 	for k, v := range in {
-		cp := make([]byte, len(v))
-		copy(cp, v)
-		out[k] = cp
+		out[k] = v
 	}
 	return out
 }
@@ -981,13 +1020,7 @@ func marshalOutput(values map[string]json.RawMessage) ([]byte, error) {
 	if len(values) == 0 {
 		return []byte(`{}`), nil
 	}
-	out := make(map[string]json.RawMessage, len(values))
-	for k, v := range values {
-		cp := make([]byte, len(v))
-		copy(cp, v)
-		out[k] = cp
-	}
-	raw, err := json.Marshal(out)
+	raw, err := json.Marshal(values)
 	if err != nil {
 		return nil, fmt.Errorf("durablepg: marshal output: %w", err)
 	}

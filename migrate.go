@@ -64,7 +64,6 @@ func (e *Engine) ApplySchema(ctx context.Context) error {
 	if err = tx.Commit(ctx); err != nil {
 		return fmt.Errorf("durablepg: commit schema migration: %w", err)
 	}
-	_ = e.postgresVersion(ctx)
 	return nil
 }
 

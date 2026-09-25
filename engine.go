@@ -57,10 +57,6 @@ type Engine struct {
 	// Claims can outlive StartWorker's bounded drain if user steps ignore context.
 	activeClaims sync.WaitGroup
 
-	versionMu      sync.Mutex
-	postgresMajor  int
-	checkedVersion bool
-
 	workerMu      sync.Mutex
 	workerRunning bool
 }
@@ -229,7 +225,7 @@ func (e *Engine) Enqueue(ctx context.Context, name string, input any, opts ...En
 		o.maxAttempts = defaultMaxAttempts
 	}
 	if o.runID == "" {
-		o.runID = WorkflowID(e.nextRunID(ctx))
+		o.runID = WorkflowID(newUUID())
 	}
 
 	nextRunAt := time.Now().UTC()
@@ -292,6 +288,11 @@ func (e *Engine) EmitEvent(ctx context.Context, key string, payload any) error {
 		return fmt.Errorf("durablepg: begin emit tx: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	// Match parkForEvent's (schema, key) lock before writing the event or
+	// inspecting waiters. Both sides then see the other's committed transaction.
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1::text), hashtext($2::text))", e.schema, key); err != nil {
+		return fmt.Errorf("durablepg: lock event key: %w", err)
+	}
 
 	insertEvent := fmt.Sprintf(`
 INSERT INTO %s (event_key, payload_json, created_at, expires_at)
@@ -360,38 +361,6 @@ func (e *Engine) table(name string) string {
 
 func quoteIdentifier(v string) string {
 	return `"` + strings.ReplaceAll(v, `"`, `""`) + `"`
-}
-
-func (e *Engine) nextRunID(ctx context.Context) string {
-	if e.postgresVersion(ctx) >= 18 {
-		var id string
-		if err := e.db.QueryRow(ctx, "SELECT uuidv7()::text;").Scan(&id); err == nil && id != "" {
-			return id
-		}
-	}
-	return newUUID()
-}
-
-func (e *Engine) postgresVersion(ctx context.Context) int {
-	e.versionMu.Lock()
-	if e.checkedVersion {
-		v := e.postgresMajor
-		e.versionMu.Unlock()
-		return v
-	}
-	e.versionMu.Unlock()
-
-	var num int
-	if err := e.db.QueryRow(ctx, "SHOW server_version_num;").Scan(&num); err != nil {
-		return 0
-	}
-
-	major := num / 10000
-	e.versionMu.Lock()
-	e.postgresMajor = major
-	e.checkedVersion = true
-	e.versionMu.Unlock()
-	return major
 }
 
 func (e *Engine) beginWorker() error {
