@@ -282,7 +282,7 @@ func run() error {
 		})
 	})
 	_, err = db.Exec(ctx, `INSERT INTO growthbench.workflow_runs (id,workflow_name,workflow_version,queue,state,step_index,attempt,max_attempts,next_run_at,input_json)
-		SELECT 'probe-'||g,'probe',1,'probe','ready',0,0,25,now()-interval '1 minute','{}'::jsonb FROM generate_series(1,16) g`)
+		SELECT md5('probe-'||g)::uuid,'probe',1,'probe','ready',0,0,25,now()-interval '1 minute','{}'::jsonb FROM generate_series(1,16) g`)
 	if err != nil {
 		return err
 	}

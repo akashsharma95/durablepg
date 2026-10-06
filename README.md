@@ -216,16 +216,16 @@ go run ./cmd/growthbench -profile=default -stage=45s -rate=100 -active=64 -histo
 
 The workload holds 64 long claims at the default 10-second heartbeat, enqueues 100 real short workflows per second, and adds terminal runs plus checkpoints at each history milestone. `tuned` tests per-table `autovacuum_vacuum_scale_factor=0.005`, `autovacuum_vacuum_threshold=200`, and `vacuum_index_cleanup=on`; it is an experimental comparison, **not** a production setting. Output includes productive claim-query p50/p95/p99, claim/recovery buffer probes, physical dead tuples, relation sizes, per-run-table autovacuum count/time, cluster-wide autovacuum relation I/O, total WAL bytes, and pool waits. Synthetic history isolates the effect of retained rows; the short workflows generate real claim/checkpoint/finish updates. Short local runs do not establish cold-cache or long-term production performance.
 
-One paired local PostgreSQL 18.6 Podman run, using fresh containers per profile and 45-second stages, measured the following on the **previous** schema (text IDs, per-claim heartbeats); it has not been repeated on the current one:
+One local PostgreSQL 18.6 Podman run per profile, each on a fresh container with 45-second stages, measured the current schema. The previous schema's run (text IDs, per-claim heartbeats) is shown for comparison:
 
-| Retained terminal runs | Default claim p95 | Tuned claim p95 | Default / tuned run-table autovacuums |
+| Retained terminal runs | Default claim p95 (previous) | Tuned claim p95 (previous) | Default / tuned run-table autovacuums |
 | ---: | ---: | ---: | ---: |
-| 0 | 1.04 ms | 1.01 ms | 0 / 0 |
-| 100,000 | 1.02 ms | 1.03 ms | 1 / 1 |
-| 300,000 | 1.05 ms | 1.04 ms | 2 / 2 |
-| 1,000,000 | 1.03 ms | 1.07 ms | 0 / 1 |
+| 0 | 1.02 ms (1.04) | 0.96 ms (1.01) | 0 / 0 |
+| 100,000 | 1.00 ms (1.02) | 0.95 ms (1.03) | 1 / 1 |
+| 300,000 | 0.94 ms (1.05) | 0.95 ms (1.04) | 2 / 2 |
+| 1,000,000 | 0.93 ms (1.03) | 0.96 ms (1.07) | 3 / 3 |
 
-The million-row profiles were separate 0→1,000,000 runs. At that milestone, the default profile had 5,418 dead leased-index entries and its expired-lease probe hit 94 buffers; the tuned profile had 1,252 dead entries but hit 191 buffers. Tuned vacuum spent 5.2 seconds on `workflow_runs` and scanned all 19,437 heap pages after the large insert. Cluster-wide autovacuum relation reads/writes were 128/78 MiB with defaults versus 310/165 MiB tuned; these I/O totals also include other tables. Neither profile showed a meaningful claim-latency regression through one million retained runs, and these data do **not** justify the tested vacuum override or active/history separation. Single runs, synthetic history, local caches, and the brief duration limit that conclusion.
+The current run reached one million rows as a fourth stage of the same run, so its autovacuum counts are cumulative; the previous one used separate 0→1,000,000 runs. At one million, the default profile had 4,392 dead leased-index entries and its expired-lease probe hit 11 buffers (previously 5,418 and 94); the tuned profile had none and hit 2 (previously 1,252 and 191). Run-table autovacuum time to that point was 3.9 s default and 4.3 s tuned. Cluster-wide autovacuum relation reads/writes were 190/125 MiB with defaults versus 388/127 MiB tuned; these totals include other tables. Neither profile showed a claim-latency regression through one million retained runs, and these data still do **not** justify the tested vacuum override or active/history separation. Single runs, synthetic history, local caches, and the brief duration limit that conclusion.
 
 ## License
 
