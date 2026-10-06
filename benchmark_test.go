@@ -206,7 +206,7 @@ func BenchmarkE2EEventWakeLatency(b *testing.B) {
 	const eventKey = "event_wake_bench"
 
 	h.engine.RegisterWorkflow("event_wake_bench", func(wf *Builder) {
-		wf.WaitEvent(eventKey, time.Minute)
+		wf.WaitEvent("signal", eventKey, time.Minute)
 		wf.Step("resume", func(context.Context, *StepContext) (any, error) {
 			return map[string]any{"resumed": true}, nil
 		})
@@ -235,7 +235,7 @@ func BenchmarkE2EEventWakeLatency(b *testing.B) {
 		}
 
 		wakeStarted := time.Now()
-		if err := h.engine.EmitEvent(context.Background(), eventKey, map[string]any{"iteration": i}); err != nil {
+		if _, err := h.engine.EmitEvent(context.Background(), eventKey, map[string]any{"iteration": i}); err != nil {
 			b.StopTimer()
 			b.Fatalf("event wake benchmark emit failed: %v", err)
 		}
@@ -403,8 +403,7 @@ func benchmarkPool(tb testing.TB) *pgxpool.Pool {
 	adminConf := benchmarkAdminConfig(tb)
 	testConf := pgtestdb.Custom(tb, adminConf, benchmarkMigrator{
 		schema:      benchmarkSchemaName,
-		partitions:  12,
-		templateTag: "durablepg-bench-v1",
+		templateTag: "durablepg-bench-v2",
 	})
 
 	pool, err := pgxpool.New(ctx, testConf.URL())
@@ -457,7 +456,6 @@ func benchmarkAdminConfig(tb testing.TB) pgtestdb.Config {
 
 type benchmarkMigrator struct {
 	schema      string
-	partitions  int
 	templateTag string
 }
 
@@ -467,7 +465,7 @@ func (m benchmarkMigrator) Hash() (string, error) {
 		qSchema: quoteIdentifier(m.schema),
 	}
 
-	sum := sha256.Sum256([]byte(engine.SchemaSQL() + fmt.Sprintf("|partitions=%d|tag=%s", m.partitions, m.templateTag)))
+	sum := sha256.Sum256([]byte(engine.SchemaSQL() + "|tag=" + m.templateTag))
 	return hex.EncodeToString(sum[:]), nil
 }
 
@@ -479,12 +477,6 @@ func (m benchmarkMigrator) Migrate(ctx context.Context, db *sql.DB, _ pgtestdb.C
 
 	if _, err := db.ExecContext(ctx, engine.SchemaSQL()); err != nil {
 		return fmt.Errorf("apply durablepg schema: %w", err)
-	}
-	if m.partitions > 0 {
-		query := fmt.Sprintf("SELECT %s.ensure_event_log_partitions($1)", engine.qSchema)
-		if _, err := db.ExecContext(ctx, query, m.partitions); err != nil {
-			return fmt.Errorf("create durablepg event partitions: %w", err)
-		}
 	}
 	return nil
 }

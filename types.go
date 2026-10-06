@@ -16,6 +16,52 @@ type WorkflowID string
 
 var ErrStepResultNotFound = errors.New("durablepg: step result not found")
 
+// ErrRunNotFound reports that no run has the requested ID.
+var ErrRunNotFound = errors.New("durablepg: run not found")
+
+// RunState is the lifecycle state of a run.
+type RunState string
+
+const (
+	RunReady        RunState = "ready"
+	RunLeased       RunState = "leased"
+	RunWaitingEvent RunState = "waiting_event"
+	RunCompleted    RunState = "completed"
+	RunFailed       RunState = "failed"
+	RunCancelled    RunState = "cancelled"
+)
+
+// Terminal reports whether the run can no longer change state.
+func (s RunState) Terminal() bool {
+	return s == RunCompleted || s == RunFailed || s == RunCancelled
+}
+
+// RunStatus is a snapshot of a run's progress.
+type RunStatus struct {
+	ID              WorkflowID
+	WorkflowName    string
+	WorkflowVersion int
+	Queue           string
+	State           RunState
+	StepIndex       int
+	Attempt         int
+	MaxAttempts     int
+	LeaseFailures   int
+	NextRunAt       time.Time
+	WaitingEventKey *string
+	WaitingDeadline *time.Time
+	LastError       *string
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+}
+
+// CancelOutcome reports what Cancel did. When Cancelled is false, State is
+// the terminal state the run had already reached.
+type CancelOutcome struct {
+	Cancelled bool
+	State     RunState
+}
+
 // StepFunc runs one durable step. It must be idempotent.
 type StepFunc func(ctx context.Context, sc *StepContext) (any, error)
 
@@ -32,7 +78,18 @@ type StepContext struct {
 	Input    json.RawMessage
 	StepKey  string
 
-	values map[string]json.RawMessage
+	// values holds checkpointed results by operation index; names maps
+	// operation names to indexes for the definition being executed.
+	values []json.RawMessage
+	names  map[string]int
+}
+
+func (sc *StepContext) raw(name string) (json.RawMessage, bool) {
+	index, ok := sc.names[name]
+	if !ok || index >= len(sc.values) || sc.values[index] == nil {
+		return nil, false
+	}
+	return sc.values[index], true
 }
 
 // DecodeInput decodes workflow input into dst.
@@ -51,7 +108,7 @@ func (sc *StepContext) Value(step string, dst any) (bool, error) {
 	if sc == nil {
 		return false, errors.New("nil step context")
 	}
-	raw, ok := sc.values[step]
+	raw, ok := sc.raw(step)
 	if !ok {
 		return false, nil
 	}
@@ -76,6 +133,34 @@ func (sc *StepContext) StepResult(step string, dst any) error {
 	return nil
 }
 
+// Event decodes the outcome of a prior wait. It reports false when the wait
+// timed out, and decodes the event payload into dst when it was received.
+func (sc *StepContext) Event(wait string, dst any) (bool, error) {
+	if sc == nil {
+		return false, errors.New("nil step context")
+	}
+	raw, ok := sc.raw(wait)
+	if !ok {
+		return false, fmt.Errorf("%w: %s", ErrStepResultNotFound, wait)
+	}
+	var outcome struct {
+		Received json.RawMessage `json:"received"`
+	}
+	if string(raw) == `"timed_out"` {
+		return false, nil
+	}
+	if err := json.Unmarshal(raw, &outcome); err != nil || outcome.Received == nil {
+		return false, fmt.Errorf("decode wait outcome %q: not an event outcome", wait)
+	}
+	if dst == nil {
+		return true, nil
+	}
+	if err := json.Unmarshal(outcome.Received, dst); err != nil {
+		return true, fmt.Errorf("decode event payload %q: %w", wait, err)
+	}
+	return true, nil
+}
+
 // WorkflowID returns the current workflow run ID.
 func (sc *StepContext) WorkflowID() WorkflowID {
 	if sc == nil {
@@ -97,7 +182,7 @@ func (sc *StepContext) RawValue(step string) (json.RawMessage, bool) {
 	if sc == nil {
 		return nil, false
 	}
-	raw, ok := sc.values[step]
+	raw, ok := sc.raw(step)
 	if !ok {
 		return nil, false
 	}

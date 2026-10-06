@@ -19,6 +19,7 @@ func TestNewRequiresDB(t *testing.T) {
 	}
 }
 
+// Run IDs are UUIDv7 so primary-key inserts stay clustered by time.
 func TestNewUUIDFormat(t *testing.T) {
 	id := newUUID()
 	if len(id) != 36 {
@@ -26,6 +27,13 @@ func TestNewUUIDFormat(t *testing.T) {
 	}
 	if id[8] != '-' || id[13] != '-' || id[18] != '-' || id[23] != '-' {
 		t.Fatalf("newUUID() = %q, invalid format", id)
+	}
+	if id[14] != '7' {
+		t.Fatalf("newUUID() = %q, want version 7", id)
+	}
+	time.Sleep(2 * time.Millisecond)
+	if later := newUUID(); later <= id {
+		t.Fatalf("newUUID() not time-ordered: %q then %q", id, later)
 	}
 }
 
@@ -71,7 +79,7 @@ func integrationEngine(t *testing.T) (*Engine, *pgxpool.Pool) {
 		}
 		pool.Close()
 	})
-	if err := engine.Init(context.Background()); err != nil {
+	if err := engine.ApplySchema(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	return engine, pool
@@ -147,7 +155,7 @@ func TestIntegrationUnregisteredWorkflowRemainsReady(t *testing.T) {
 func TestIntegrationEventKeysArePerRun(t *testing.T) {
 	e, _ := integrationEngine(t)
 	e.RegisterWorkflow("orders", func(b *Builder) {
-		b.WaitEventFunc(func(sc *StepContext) (string, error) {
+		b.WaitEventFunc("paid", func(sc *StepContext) (string, error) {
 			var in struct {
 				OrderID string `json:"order_id"`
 			}
@@ -170,7 +178,7 @@ func TestIntegrationEventKeysArePerRun(t *testing.T) {
 	}
 	waitRunState(t, e, first, "waiting_event")
 	waitRunState(t, e, second, "waiting_event")
-	if err := e.EmitEvent(context.Background(), "order.paid:first", true); err != nil {
+	if _, err := e.EmitEvent(context.Background(), "order.paid:first", true); err != nil {
 		t.Fatal(err)
 	}
 	waitRunState(t, e, first, "completed")
@@ -181,7 +189,7 @@ func TestIntegrationEventKeysArePerRun(t *testing.T) {
 	if state != "waiting_event" {
 		t.Fatalf("unrelated order resumed: %s", state)
 	}
-	if err := e.EmitEvent(context.Background(), "order.paid:second", true); err != nil {
+	if _, err := e.EmitEvent(context.Background(), "order.paid:second", true); err != nil {
 		t.Fatal(err)
 	}
 	waitRunState(t, e, second, "completed")
@@ -232,7 +240,6 @@ func TestIntegrationWorkerWithOneConnection(t *testing.T) {
 	worker.RegisterWorkflow("single_pool", build)
 	stop := startTestWorker(t, worker)
 	defer stop()
-	time.Sleep(100 * time.Millisecond) // Allow LISTEN to acquire the only connection if enabled.
 	runID, err := producer.Run(context.Background(), "single_pool", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -301,7 +308,7 @@ func TestIntegrationOldLeaseCannotCheckpoint(t *testing.T) {
 		stop()
 		t.Fatal("step did not start")
 	}
-	query := fmt.Sprintf("UPDATE %s SET lease_owner = 'new_owner' WHERE id = $1 AND state = 'leased'", e.table("workflow_runs"))
+	query := fmt.Sprintf("UPDATE %s SET lease_token = gen_random_uuid() WHERE id = $1 AND state = 'leased'", e.table("workflow_runs"))
 	if _, err := pool.Exec(context.Background(), query, string(runID)); err != nil {
 		close(release)
 		stop()
@@ -319,90 +326,45 @@ func TestIntegrationOldLeaseCannotCheckpoint(t *testing.T) {
 	}
 }
 
-func TestIntegrationLegacySchemaMigrationAndPartitionCatchup(t *testing.T) {
+// Every process calls ApplySchema on start, so repeated and concurrent calls
+// must converge on one recorded migration.
+func TestIntegrationApplySchemaIsIdempotentAndConcurrentSafe(t *testing.T) {
 	e, pool := integrationEngine(t)
 	ctx := context.Background()
-	from := time.Now().UTC().AddDate(0, 14, 0)
-	month := time.Date(from.Year(), from.Month(), 1, 0, 0, 0, 0, time.UTC)
-	insert := fmt.Sprintf(
-		"INSERT INTO %s (event_key, payload_json, created_at) VALUES ('retained', '{}'::jsonb, $1) RETURNING id",
-		e.table("event_log"),
-	)
-	var id int64
-	if err := pool.QueryRow(ctx, insert, month.Add(12*time.Hour)).Scan(&id); err != nil {
-		t.Fatal(err)
-	}
-	e.RegisterWorkflow("legacy", func(b *Builder) {
-		b.Step("old", func(context.Context, *StepContext) (any, error) { return true, nil })
-	})
-	legacyID, err := e.Run(ctx, "legacy", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Simulate an existing, unversioned installation with the baseline tables.
-	if _, err := pool.Exec(ctx, fmt.Sprintf(
-		"DROP TABLE %s; DROP INDEX %s; DROP INDEX %s; ALTER TABLE %s DROP COLUMN workflow_version, DROP COLUMN lease_failures",
-		e.table("schema_migrations"), e.table("workflow_runs_waiting_deadline_idx"),
-		e.table("workflow_runs_selective_ready_idx"), e.table("workflow_runs"),
-	)); err != nil {
-		t.Fatal(err)
-	}
-	migrationsDone := make(chan error, 2)
+	done := make(chan error, 2)
 	for range 2 {
-		go func() { migrationsDone <- e.ApplySchema(ctx) }()
+		go func() { done <- e.ApplySchema(ctx) }()
 	}
 	for range 2 {
-		if err := <-migrationsDone; err != nil {
-			t.Fatalf("concurrent migration of unversioned installation: %v", err)
+		if err := <-done; err != nil {
+			t.Fatalf("concurrent ApplySchema: %v", err)
 		}
 	}
-	if err := e.ApplySchema(ctx); err != nil {
-		t.Fatalf("repeating migration: %v", err)
-	}
-	var indexFound bool
-	if err := pool.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", e.schema+".workflow_runs_waiting_deadline_idx").Scan(&indexFound); err != nil || !indexFound {
-		t.Fatalf("missing waiting-event deadline index: found=%v error=%v", indexFound, err)
-	}
-	var migrations int
-	if err := pool.QueryRow(ctx, fmt.Sprintf("SELECT count(*) FROM %s", e.table("schema_migrations"))).Scan(&migrations); err != nil || migrations != 4 {
-		t.Fatalf("migration history = %d, %v; want versions 1 through 4", migrations, err)
-	}
-	var restoredVersion, failures int
-	versionQuery := fmt.Sprintf("SELECT workflow_version, lease_failures FROM %s WHERE id = $1", e.table("workflow_runs"))
-	if err := pool.QueryRow(ctx, versionQuery, string(legacyID)).Scan(&restoredVersion, &failures); err != nil || restoredVersion != 1 || failures != 0 {
-		t.Fatalf("legacy run migration: version=%d failures=%d error=%v", restoredVersion, failures, err)
-	}
-
-	if err := e.EnsurePartitions(ctx, 14); err != nil {
-		t.Fatalf("creating partition with default rows: %v", err)
-	}
-	var partition string
-	where := fmt.Sprintf("SELECT tableoid::regclass::text FROM %s WHERE id = $1", e.table("event_log"))
-	if err := pool.QueryRow(ctx, where, id).Scan(&partition); err != nil {
-		t.Fatalf("event lost during repartition: %v", err)
-	}
-	want := fmt.Sprintf("event_log_%04d%02d", month.Year(), month.Month())
-	if !strings.HasSuffix(partition, want) {
-		t.Fatalf("event remained in %s rather than %s", partition, want)
-	}
-
-	next := month.AddDate(0, 1, 0)
-	if err := pool.QueryRow(ctx, insert, next.Add(12*time.Hour)).Scan(&id); err != nil {
-		t.Fatal(err)
-	}
-	ddl, err := e.EventLogMonthlyPartitionsSQL(next, 1)
+	var versions []int32
+	rows, err := pool.Query(ctx, fmt.Sprintf("SELECT version FROM %s ORDER BY version", e.table("schema_migrations")))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, ddl); err != nil {
-		t.Fatalf("generated DDL cannot repartition existing events: %v", err)
+	for rows.Next() {
+		var v int32
+		if err := rows.Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		versions = append(versions, v)
 	}
-	if err := pool.QueryRow(ctx, where, id).Scan(&partition); err != nil {
-		t.Fatalf("event lost with generated DDL: %v", err)
+	if len(versions) != 1 || versions[0] != 1 {
+		t.Fatalf("migration history = %v, want [1]", versions)
 	}
-	want = fmt.Sprintf("event_log_%04d%02d", next.Year(), next.Month())
-	if !strings.HasSuffix(partition, want) {
-		t.Fatalf("event remained in %s rather than %s", partition, want)
+}
+
+// A schema migrated by a newer library must be refused, not misused.
+func TestIntegrationNewerSchemaVersionIsRejected(t *testing.T) {
+	e, pool := integrationEngine(t)
+	if _, err := pool.Exec(context.Background(), fmt.Sprintf("INSERT INTO %s (version) VALUES (2)", e.table("schema_migrations"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.ApplySchema(context.Background()); !errors.Is(err, ErrUnsupportedSchema) {
+		t.Fatalf("ApplySchema on newer schema = %v, want ErrUnsupportedSchema", err)
 	}
 }
 
@@ -451,38 +413,53 @@ func TestIntegrationVersionedRunsRequireCompatibleWorkers(t *testing.T) {
 	waitRunState(t, producer, newRun, "completed")
 }
 
-func TestIntegrationStaleWaiterCannotWakeDifferentEvent(t *testing.T) {
-	e, pool := integrationEngine(t)
-	e.RegisterWorkflow("switch", func(b *Builder) {
-		b.WaitEvent("current", time.Minute)
-		b.Step("done", func(context.Context, *StepContext) (any, error) { return true, nil })
+// An event for one key must not wake a run waiting on another key, even one
+// it previously waited on.
+func TestIntegrationEventForPreviousKeyDoesNotWakeNextWait(t *testing.T) {
+	e, _ := integrationEngine(t)
+	e.RegisterWorkflow("two_waits", func(b *Builder) {
+		b.WaitEvent("first", "key-a", time.Minute)
+		b.WaitEvent("second", "key-c", time.Minute)
 	})
-	runID, err := e.Run(context.Background(), "switch", nil)
+	runID, err := e.Run(context.Background(), "two_waits", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	stop := startTestWorker(t, e)
 	defer stop()
+	emit := func(key string, payload int, want int) {
+		t.Helper()
+		woken, err := e.EmitEvent(context.Background(), key, payload)
+		if err != nil || woken != want {
+			t.Fatalf("EmitEvent(%s) woke %d, %v; want %d", key, woken, err, want)
+		}
+	}
 	waitRunState(t, e, runID, "waiting_event")
-	stale := fmt.Sprintf("INSERT INTO %s (event_key, run_id) VALUES ('old', $1)", e.table("waiters"))
-	if _, err := pool.Exec(context.Background(), stale, string(runID)); err != nil {
-		t.Fatal(err)
+	emit("key-b", 0, 0)
+	emit("key-a", 1, 1)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		st, err := e.RunStatus(context.Background(), runID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st.WaitingEventKey != nil && *st.WaitingEventKey == "key-c" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("run never waited on key-c: %+v", st)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	if err := e.EmitEvent(context.Background(), "old", true); err != nil {
-		t.Fatal(err)
-	}
-	var state, key string
-	query := fmt.Sprintf("SELECT state, waiting_event_key FROM %s WHERE id = $1", e.table("workflow_runs"))
-	if err := pool.QueryRow(context.Background(), query, string(runID)).Scan(&state, &key); err != nil {
-		t.Fatal(err)
-	}
-	if state != "waiting_event" || key != "current" {
-		t.Fatalf("stale event awakened current wait: state=%s key=%s", state, key)
-	}
-	if err := e.EmitEvent(context.Background(), "current", true); err != nil {
-		t.Fatal(err)
-	}
+	emit("key-a", 2, 0)
+	emit("key-c", 3, 1)
 	waitRunState(t, e, runID, "completed")
+	var outcome struct {
+		Received int `json:"received"`
+	}
+	if ok, err := e.RunOutput(context.Background(), runID, &outcome); err != nil || !ok || outcome.Received != 3 {
+		t.Fatalf("output = %+v, %v, %v; want received 3", outcome, ok, err)
+	}
 }
 
 func TestIntegrationExpiredLeasesHaveBoundedBackoff(t *testing.T) {
@@ -536,7 +513,7 @@ func TestIntegrationPruneExpiredEventsPreservesLiveEvents(t *testing.T) {
 	e, pool := integrationEngine(t)
 	ctx := context.Background()
 	for _, key := range []string{"expired", "live"} {
-		if err := e.EmitEvent(ctx, key, true); err != nil {
+		if _, err := e.EmitEvent(ctx, key, true); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -557,11 +534,15 @@ func TestIntegrationPruneExpiredEventsPreservesLiveEvents(t *testing.T) {
 	}
 }
 
-func TestIntegrationTimedOutWaitRemovesRegistration(t *testing.T) {
+// A wait that times out records that outcome, so the next step can tell a
+// timeout from a delivery.
+func TestIntegrationTimedOutWaitRecordsTimedOut(t *testing.T) {
 	e, pool := integrationEngine(t)
 	e.RegisterWorkflow("timeout", func(b *Builder) {
-		b.WaitEvent("forgotten", time.Minute)
-		b.Step("after", func(context.Context, *StepContext) (any, error) { return true, nil })
+		b.WaitEvent("payment", "forgotten", time.Minute)
+		b.Step("after", func(_ context.Context, sc *StepContext) (any, error) {
+			return sc.Event("payment", nil)
+		})
 	})
 	runID, err := e.Run(context.Background(), "timeout", nil)
 	if err != nil {
@@ -577,12 +558,14 @@ func TestIntegrationTimedOutWaitRemovesRegistration(t *testing.T) {
 	if err := e.promoteTimedOutWaiters(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	var waiters int
-	query := fmt.Sprintf("SELECT count(*) FROM %s WHERE run_id = $1", e.table("waiters"))
-	if err := pool.QueryRow(context.Background(), query, string(runID)).Scan(&waiters); err != nil || waiters != 0 {
-		t.Fatalf("timeout left %d registrations: %v", waiters, err)
-	}
 	waitRunState(t, e, runID, "completed")
+	var received bool
+	if ok, err := e.RunOutput(context.Background(), runID, &received); err != nil || !ok || received {
+		t.Fatalf("after timeout, Event reported received=%v (ok=%v, err=%v)", received, ok, err)
+	}
+	if woken, err := e.EmitEvent(context.Background(), "forgotten", true); err != nil || woken != 0 {
+		t.Fatalf("late event woke %d runs, %v", woken, err)
+	}
 }
 
 func TestIntegrationExternalIdempotencyKeySurvivesRetry(t *testing.T) {
@@ -611,7 +594,7 @@ func TestIntegrationExternalIdempotencyKeySurvivesRetry(t *testing.T) {
 	defer stop()
 	waitRunState(t, e, runID, "completed")
 	first, second, third := <-keys, <-keys, <-keys
-	if first != second || first == third || first != string(runID)+":0000:charge" || third != string(runID)+":0001:ship" {
+	if first != second || first == third || first != string(runID)+":0:charge" || third != string(runID)+":1:ship" {
 		t.Fatalf("idempotency keys across retry and steps: %q %q %q", first, second, third)
 	}
 }
@@ -665,5 +648,128 @@ func TestIntegrationWaitForIdleIncludesUncooperativeStep(t *testing.T) {
 	defer finish()
 	if err := e.WaitForIdle(joined); err != nil {
 		t.Fatalf("step did not quiesce: %v", err)
+	}
+}
+
+// Cancelling a running run must cancel its step context promptly and fence
+// its writes; cancelling again reports the terminal state.
+func TestIntegrationCancelStopsRunningStep(t *testing.T) {
+	e, _ := integrationEngine(t)
+	started := make(chan struct{})
+	stopped := make(chan struct{})
+	e.RegisterWorkflow("cancel_me", func(b *Builder) {
+		b.Step("block", func(ctx context.Context, _ *StepContext) (any, error) {
+			close(started)
+			<-ctx.Done()
+			close(stopped)
+			return nil, ctx.Err()
+		})
+	})
+	stop := startTestWorker(t, e)
+	defer stop()
+	runID, err := e.Run(context.Background(), "cancel_me", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	if out, err := e.Cancel(context.Background(), runID); err != nil || !out.Cancelled {
+		t.Fatalf("Cancel = %+v, %v", out, err)
+	}
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled step context was not canceled")
+	}
+	st, err := e.RunStatus(context.Background(), runID)
+	if err != nil || st.State != RunCancelled {
+		t.Fatalf("status after cancel = %+v, %v", st, err)
+	}
+	if out, err := e.Cancel(context.Background(), runID); err != nil || out.Cancelled || out.State != RunCancelled {
+		t.Fatalf("second Cancel = %+v, %v", out, err)
+	}
+	if _, err := e.Cancel(context.Background(), WorkflowID(newUUID())); !errors.Is(err, ErrRunNotFound) {
+		t.Fatalf("Cancel of unknown run = %v, want ErrRunNotFound", err)
+	}
+}
+
+// Cancelling a waiting run removes it from event delivery.
+func TestIntegrationCancelledWaitingRunIsNotWoken(t *testing.T) {
+	e, _ := integrationEngine(t)
+	e.RegisterWorkflow("wait_cancel", func(b *Builder) {
+		b.WaitEvent("signal", "cancel-key", time.Minute)
+	})
+	stop := startTestWorker(t, e)
+	defer stop()
+	runID, err := e.Run(context.Background(), "wait_cancel", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitRunState(t, e, runID, "waiting_event")
+	if out, err := e.Cancel(context.Background(), runID); err != nil || !out.Cancelled {
+		t.Fatalf("Cancel = %+v, %v", out, err)
+	}
+	if woken, err := e.EmitEvent(context.Background(), "cancel-key", 1); err != nil || woken != 0 {
+		t.Fatalf("event woke %d cancelled runs, %v", woken, err)
+	}
+}
+
+// Notifications drive dispatch: with polling effectively disabled, a new run
+// still starts promptly through the listener's dedicated connection.
+func TestIntegrationNotificationWakesIdleWorker(t *testing.T) {
+	producer, pool := integrationEngine(t)
+	worker, err := New(Config{DB: pool, Schema: producer.schema, PollInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	build := func(b *Builder) {
+		b.Step("done", func(context.Context, *StepContext) (any, error) { return true, nil })
+	}
+	producer.RegisterWorkflow("notified", build)
+	worker.RegisterWorkflow("notified", build)
+	stop := startTestWorker(t, worker)
+	defer stop()
+	// Let the first poll and listener setup pass.
+	time.Sleep(300 * time.Millisecond)
+	runID, err := producer.Run(context.Background(), "notified", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitRunState(t, producer, runID, "completed")
+}
+
+// The notify channel is per schema, so engines on different schemas in one
+// database do not wake each other.
+func TestIntegrationNotificationsAreScopedToSchema(t *testing.T) {
+	e, pool := integrationEngine(t)
+	e.RegisterWorkflow("scoped", func(b *Builder) {
+		b.Step("done", func(context.Context, *StepContext) (any, error) { return true, nil })
+	})
+	listen := func(channel string) *pgxpool.Conn {
+		conn, err := pool.Acquire(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := conn.Exec(context.Background(), "LISTEN "+quoteIdentifier(channel)); err != nil {
+			t.Fatal(err)
+		}
+		return conn
+	}
+	own := listen("durablepg_" + e.schema)
+	defer own.Release()
+	foreign := listen("durablepg_other_" + e.schema)
+	defer foreign.Release()
+	if _, err := e.Run(context.Background(), "scoped", nil); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	note, err := own.Conn().WaitForNotification(ctx)
+	if err != nil || note.Payload != "default" {
+		t.Fatalf("own schema notification = %+v, %v; want queue payload", note, err)
+	}
+	short, cancelShort := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancelShort()
+	if stray, err := foreign.Conn().WaitForNotification(short); err == nil {
+		t.Fatalf("other schema was notified: %+v", stray)
 	}
 }

@@ -24,6 +24,8 @@ func TestResolveWaitKeyUsesCurrentRunAndCompletedValues(t *testing.T) {
 		raw[0] = '!'
 		return string(sc.RunID) + ":" + sc.Workflow + ":" + input.Order + ":" + previous.Region, nil
 	}}
+	wf := &compiledWorkflow{names: map[string]int{"lookup": 0, "wait": 1}}
+	e := &Engine{}
 	for _, tc := range []struct {
 		run    claimedRun
 		region string
@@ -32,12 +34,12 @@ func TestResolveWaitKeyUsesCurrentRunAndCompletedValues(t *testing.T) {
 		{claimedRun{ID: "run-1", WorkflowName: "orders", Input: []byte(`{"order":"one"}`)}, "west", "run-1:orders:one:west"},
 		{claimedRun{ID: "run-2", WorkflowName: "orders", Input: []byte(`{"order":"two"}`)}, "east", "run-2:orders:two:east"},
 	} {
-		values := map[string]json.RawMessage{"lookup": json.RawMessage(`{"region":"` + tc.region + `"}`)}
-		key, err := resolveWaitKey(tc.run, wait, values)
+		values := []json.RawMessage{json.RawMessage(`{"region":"` + tc.region + `"}`), nil}
+		key, err := wait.resolve(e.stepContext(tc.run, wf, values, 1, "wait"))
 		if err != nil || key != tc.want {
-			t.Fatalf("resolveWaitKey(%s) = %q, %v; want %q", tc.run.ID, key, err, tc.want)
+			t.Fatalf("resolve(%s) = %q, %v; want %q", tc.run.ID, key, err, tc.want)
 		}
-		if !json.Valid(values["lookup"]) {
+		if !json.Valid(values[0]) {
 			t.Fatalf("resolver mutated completed values for %s", tc.run.ID)
 		}
 	}

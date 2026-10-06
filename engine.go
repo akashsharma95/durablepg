@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -25,7 +26,9 @@ const (
 	defaultHeartbeatInterval = 10 * time.Second
 	defaultMaxAttempts       = 25
 	defaultEventTTL          = 24 * time.Hour
-	notifyChannel            = "durable_wakeup"
+	// Leaves room for the "durablepg_" channel prefix within PostgreSQL's
+	// 63-byte identifier limit.
+	maxSchemaLength = 48
 )
 
 var identPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
@@ -42,6 +45,9 @@ type Engine struct {
 	schema  string
 	qSchema string
 	queue   string
+	// channel carries NOTIFY wakeups for this schema; the payload is a queue.
+	channel string
+	sql     queries
 
 	maxConcurrency int
 	pollInterval   time.Duration
@@ -71,7 +77,7 @@ func New(cfg Config) (*Engine, error) {
 	if schema == "" {
 		schema = defaultSchema
 	}
-	if !identPattern.MatchString(schema) {
+	if !identPattern.MatchString(schema) || len(schema) > maxSchemaLength {
 		return nil, fmt.Errorf("durablepg: invalid schema %q", schema)
 	}
 
@@ -118,6 +124,8 @@ func New(cfg Config) (*Engine, error) {
 		schema:         schema,
 		qSchema:        quoteIdentifier(schema),
 		queue:          queue,
+		channel:        "durablepg_" + schema,
+		sql:            newQueries(quoteIdentifier(schema)),
 		maxConcurrency: maxConcurrency,
 		pollInterval:   pollInterval,
 		leaseTTL:       leaseTTL,
@@ -227,37 +235,17 @@ func (e *Engine) Enqueue(ctx context.Context, name string, input any, opts ...En
 	if o.runID == "" {
 		o.runID = WorkflowID(newUUID())
 	}
-
-	nextRunAt := time.Now().UTC()
-	if o.scheduledAt != nil {
-		nextRunAt = o.scheduledAt.UTC()
+	var dedupKey *string
+	if o.idempotencyKey != "" {
+		dedupKey = &o.idempotencyKey
 	}
 
 	var runID string
-	if o.idempotencyKey != "" {
-		query := fmt.Sprintf(`
-INSERT INTO %s (id, workflow_name, workflow_version, queue, state, step_index, attempt, max_attempts, next_run_at, input_json, idempotency_key, created_at, updated_at)
-VALUES ($1, $2, $3, $4, 'ready', 0, 0, $5, $6, $7::jsonb, $8, now(), now())
-ON CONFLICT (workflow_name, idempotency_key)
-WHERE idempotency_key IS NOT NULL
-DO UPDATE SET updated_at = now()
-RETURNING id;
-`, e.table("workflow_runs"))
-		if err := e.db.QueryRow(ctx, query, string(o.runID), wf.name, wf.version, o.queue, o.maxAttempts, nextRunAt, rawInput, o.idempotencyKey).Scan(&runID); err != nil {
-			return "", fmt.Errorf("durablepg: enqueue upsert: %w", err)
-		}
-	} else {
-		query := fmt.Sprintf(`
-INSERT INTO %s (id, workflow_name, workflow_version, queue, state, step_index, attempt, max_attempts, next_run_at, input_json, created_at, updated_at)
-VALUES ($1, $2, $3, $4, 'ready', 0, 0, $5, $6, $7::jsonb, now(), now())
-RETURNING id;
-`, e.table("workflow_runs"))
-		if err := e.db.QueryRow(ctx, query, string(o.runID), wf.name, wf.version, o.queue, o.maxAttempts, nextRunAt, rawInput).Scan(&runID); err != nil {
-			return "", fmt.Errorf("durablepg: enqueue insert: %w", err)
-		}
+	var notified int64
+	if err := e.db.QueryRow(ctx, e.sql.insertRun, string(o.runID), wf.name, wf.version, o.queue,
+		o.maxAttempts, o.scheduledAt, rawInput, dedupKey, e.channel).Scan(&runID, &notified); err != nil {
+		return "", fmt.Errorf("durablepg: enqueue: %w", err)
 	}
-
-	e.notifyWakeup(ctx, o.queue)
 	return WorkflowID(runID), nil
 }
 
@@ -271,88 +259,109 @@ func (e *Engine) RunWorkflow(ctx context.Context, name string, input any, opts .
 	return e.Run(ctx, name, input, opts...)
 }
 
-// EmitEvent records an event and wakes waiting workflows.
-func (e *Engine) EmitEvent(ctx context.Context, key string, payload any) error {
+// EmitEvent records an event and wakes runs waiting on key, returning how
+// many woke. Events stay available to later waits for 24 hours.
+func (e *Engine) EmitEvent(ctx context.Context, key string, payload any) (int, error) {
 	key = strings.TrimSpace(key)
 	if key == "" {
-		return errors.New("durablepg: event key is required")
+		return 0, errors.New("durablepg: event key is required")
 	}
 
 	raw, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("durablepg: marshal event payload: %w", err)
+		return 0, fmt.Errorf("durablepg: marshal event payload: %w", err)
 	}
 
-	tx, err := e.db.Begin(ctx)
+	tx, err := e.beginEventTx(ctx)
 	if err != nil {
-		return fmt.Errorf("durablepg: begin emit tx: %w", err)
+		return 0, fmt.Errorf("durablepg: begin emit tx: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
-	// Match parkForEvent's (schema, key) lock before writing the event or
-	// inspecting waiters. Both sides then see the other's committed transaction.
-	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1::text), hashtext($2::text))", e.schema, key); err != nil {
-		return fmt.Errorf("durablepg: lock event key: %w", err)
+	// Serializes with waiter registration for this key. The wake statement
+	// below starts after the lock, so its snapshot sees any waiter that
+	// committed first; a waiter that registers later sees this event.
+	if _, err := tx.Exec(ctx, e.sql.lockEventKey, e.schema, key); err != nil {
+		return 0, fmt.Errorf("durablepg: lock event key: %w", err)
 	}
-
-	insertEvent := fmt.Sprintf(`
-INSERT INTO %s (event_key, payload_json, created_at, expires_at)
-VALUES ($1, $2::jsonb, now(), now() + ($3::bigint * INTERVAL '1 millisecond'));
-`, e.table("event_log"))
-	if _, err := tx.Exec(ctx, insertEvent, key, raw, e.eventTTL.Milliseconds()); err != nil {
-		return fmt.Errorf("durablepg: insert event: %w", err)
+	var woken, notified int64
+	if err := tx.QueryRow(ctx, e.sql.emitEvent, key, raw, e.eventTTL.Milliseconds(), e.channel).Scan(&woken, &notified); err != nil {
+		return 0, fmt.Errorf("durablepg: emit event: %w", err)
 	}
-
-	wakeQuery := fmt.Sprintf(`
-WITH awakened AS (
-	UPDATE %s wr
-	SET state = 'ready',
-		next_run_at = now(),
-		waiting_event_key = NULL,
-		waiting_deadline = NULL,
-		lease_owner = NULL,
-		lease_until = NULL,
-		last_error = NULL,
-		updated_at = now()
-	WHERE wr.state = 'waiting_event'
-	  AND wr.waiting_event_key = $1
-	  AND wr.id IN (
-		SELECT w.run_id
-		FROM %s w
-		WHERE w.event_key = $1
-		  AND w.run_id = wr.id
-		  AND (w.deadline IS NULL OR w.deadline > now())
-	)
-	RETURNING wr.id
-)
-DELETE FROM %s w
-USING awakened a
-WHERE w.run_id = a.id AND w.event_key = $1;
-`, e.table("workflow_runs"), e.table("waiters"), e.table("waiters"))
-	if _, err := tx.Exec(ctx, wakeQuery, key); err != nil {
-		return fmt.Errorf("durablepg: wake waiters: %w", err)
-	}
-
-	cleanupWaiters := fmt.Sprintf(`
-DELETE FROM %s
-WHERE event_key = $1
-  AND deadline IS NOT NULL
-  AND deadline <= now();
-`, e.table("waiters"))
-	if _, err := tx.Exec(ctx, cleanupWaiters, key); err != nil {
-		return fmt.Errorf("durablepg: cleanup waiters: %w", err)
-	}
-
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("durablepg: commit emit tx: %w", err)
+		return 0, fmt.Errorf("durablepg: commit emit tx: %w", err)
 	}
-
-	e.notifyWakeup(ctx, e.queue)
-	return nil
+	return int(woken), nil
 }
 
-func (e *Engine) notifyWakeup(ctx context.Context, payload string) {
-	const query = "SELECT pg_notify($1, $2);"
-	_, _ = e.db.Exec(ctx, query, notifyChannel, payload)
+// beginEventTx starts a transaction for the event-key protocol. Each statement
+// after the key lock must see rows committed before it, which READ COMMITTED
+// guarantees and a REPEATABLE READ server default would not.
+func (e *Engine) beginEventTx(ctx context.Context) (pgx.Tx, error) {
+	return e.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+}
+
+// RunStatus returns a snapshot of a run, or ErrRunNotFound.
+func (e *Engine) RunStatus(ctx context.Context, id WorkflowID) (RunStatus, error) {
+	var st RunStatus
+	var runID, state string
+	err := e.db.QueryRow(ctx, e.sql.runStatus, string(id)).Scan(&runID, &st.WorkflowName, &st.WorkflowVersion,
+		&st.Queue, &state, &st.StepIndex, &st.Attempt, &st.MaxAttempts, &st.LeaseFailures, &st.NextRunAt,
+		&st.WaitingEventKey, &st.WaitingDeadline, &st.LastError, &st.CreatedAt, &st.UpdatedAt)
+	if isNoRows(err) {
+		return RunStatus{}, ErrRunNotFound
+	}
+	if err != nil {
+		return RunStatus{}, fmt.Errorf("durablepg: run status: %w", err)
+	}
+	st.ID, st.State = WorkflowID(runID), RunState(state)
+	return st, nil
+}
+
+// RunOutput decodes a completed run's output, the result of its last step or
+// wait, into dst. It reports false until the run has completed.
+func (e *Engine) RunOutput(ctx context.Context, id WorkflowID, dst any) (bool, error) {
+	var state string
+	var output []byte
+	err := e.db.QueryRow(ctx, e.sql.runOutput, string(id)).Scan(&state, &output)
+	if isNoRows(err) {
+		return false, ErrRunNotFound
+	}
+	if err != nil {
+		return false, fmt.Errorf("durablepg: run output: %w", err)
+	}
+	if RunState(state) != RunCompleted {
+		return false, nil
+	}
+	if output == nil {
+		output = []byte("null")
+	}
+	if err := json.Unmarshal(output, dst); err != nil {
+		return true, fmt.Errorf("durablepg: decode run output: %w", err)
+	}
+	return true, nil
+}
+
+// Cancel moves an unfinished run to cancelled. A worker executing it loses its
+// lease, and its step context is canceled at the next lease renewal.
+func (e *Engine) Cancel(ctx context.Context, id WorkflowID) (CancelOutcome, error) {
+	tag, err := e.db.Exec(ctx, e.sql.cancelRun, string(id))
+	if err != nil {
+		return CancelOutcome{}, fmt.Errorf("durablepg: cancel run: %w", err)
+	}
+	if tag.RowsAffected() > 0 {
+		return CancelOutcome{Cancelled: true, State: RunCancelled}, nil
+	}
+	// A separate statement: if the UPDATE waited on a worker that just
+	// finished the run, its own snapshot still shows the old state.
+	var state string
+	err = e.db.QueryRow(ctx, e.sql.runState, string(id)).Scan(&state)
+	if isNoRows(err) {
+		return CancelOutcome{}, ErrRunNotFound
+	}
+	if err != nil {
+		return CancelOutcome{}, fmt.Errorf("durablepg: read cancelled run: %w", err)
+	}
+	return CancelOutcome{State: RunState(state)}, nil
 }
 
 func (e *Engine) table(name string) string {
@@ -401,13 +410,17 @@ func (e *Engine) WaitForIdle(ctx context.Context) error {
 	}
 }
 
+// newUUID returns a time-ordered UUIDv7, which keeps primary-key inserts
+// clustered at the end of the index.
 func newUUID() string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
-		return fmt.Sprintf("run-%d", time.Now().UnixNano())
+		panic(fmt.Sprintf("durablepg: read random bytes: %v", err))
 	}
-
-	b[6] = (b[6] & 0x0f) | 0x40
+	ms := uint64(time.Now().UnixMilli())
+	b[0], b[1], b[2] = byte(ms>>40), byte(ms>>32), byte(ms>>24)
+	b[3], b[4], b[5] = byte(ms>>16), byte(ms>>8), byte(ms)
+	b[6] = (b[6] & 0x0f) | 0x70
 	b[8] = (b[8] & 0x3f) | 0x80
 
 	var out [36]byte

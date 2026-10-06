@@ -29,6 +29,7 @@ type stepOp struct {
 }
 
 type waitEventOp struct {
+	name    string
 	key     string
 	keyFn   func(*StepContext) (string, error)
 	timeout time.Duration
@@ -61,17 +62,11 @@ type Builder struct {
 	stepNames map[string]struct{}
 }
 
-// Step appends a durable function step.
-func (b *Builder) Step(name string, fn StepFunc, opts ...StepOption) {
-	if b == nil {
-		panic("durablepg: nil builder")
-	}
+// addName registers a step or wait name; results are looked up by name.
+func (b *Builder) addName(name string) string {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		panic("durablepg: step name is required")
-	}
-	if fn == nil {
-		panic(fmt.Sprintf("durablepg: step %q has nil function", name))
 	}
 	if b.stepNames == nil {
 		b.stepNames = make(map[string]struct{})
@@ -80,6 +75,18 @@ func (b *Builder) Step(name string, fn StepFunc, opts ...StepOption) {
 		panic(fmt.Sprintf("durablepg: duplicate step name %q", name))
 	}
 	b.stepNames[name] = struct{}{}
+	return name
+}
+
+// Step appends a durable function step.
+func (b *Builder) Step(name string, fn StepFunc, opts ...StepOption) {
+	if b == nil {
+		panic("durablepg: nil builder")
+	}
+	if fn == nil {
+		panic(fmt.Sprintf("durablepg: step %q has nil function", name))
+	}
+	name = b.addName(name)
 
 	o := stepOptions{}
 	for _, opt := range opts {
@@ -109,7 +116,8 @@ func (b *Builder) Sleep(d time.Duration) {
 }
 
 // WaitEvent pauses execution until key is emitted or timeout is reached.
-func (b *Builder) WaitEvent(key string, timeout time.Duration) {
+// Later steps read the outcome with StepContext.Event(name, &payload).
+func (b *Builder) WaitEvent(name, key string, timeout time.Duration) {
 	if b == nil {
 		panic("durablepg: nil builder")
 	}
@@ -122,13 +130,13 @@ func (b *Builder) WaitEvent(key string, timeout time.Duration) {
 	}
 	b.ops = append(b.ops, operation{
 		kind: opWaitEvent,
-		wait: &waitEventOp{key: key, timeout: timeout},
+		wait: &waitEventOp{name: b.addName(name), key: key, timeout: timeout},
 	})
 }
 
 // WaitEventFunc resolves a run-specific event key from its input and prior steps.
 // The resolver may be called again after a retry; it must be deterministic.
-func (b *Builder) WaitEventFunc(keyFn func(*StepContext) (string, error), timeout time.Duration) {
+func (b *Builder) WaitEventFunc(name string, keyFn func(*StepContext) (string, error), timeout time.Duration) {
 	if b == nil {
 		panic("durablepg: nil builder")
 	}
@@ -140,7 +148,7 @@ func (b *Builder) WaitEventFunc(keyFn func(*StepContext) (string, error), timeou
 	}
 	b.ops = append(b.ops, operation{
 		kind: opWaitEvent,
-		wait: &waitEventOp{keyFn: keyFn, timeout: timeout},
+		wait: &waitEventOp{name: b.addName(name), keyFn: keyFn, timeout: timeout},
 	})
 }
 
@@ -148,6 +156,10 @@ type compiledWorkflow struct {
 	name    string
 	version int
 	ops     []operation
+	// names maps step and wait names to operation indexes.
+	names map[string]int
+	// outputIndex is the last value-producing operation, or -1 if none.
+	outputIndex int
 }
 
 type workflowDefinition struct {
@@ -201,5 +213,17 @@ func compileWorkflow(wf Workflow) (*compiledWorkflow, error) {
 
 	ops := make([]operation, len(b.ops))
 	copy(ops, b.ops)
-	return &compiledWorkflow{name: name, version: version, ops: ops}, nil
+	names := make(map[string]int, len(ops))
+	outputIndex := -1
+	for i, op := range ops {
+		switch op.kind {
+		case opStep:
+			names[op.step.name] = i
+			outputIndex = i
+		case opWaitEvent:
+			names[op.wait.name] = i
+			outputIndex = i
+		}
+	}
+	return &compiledWorkflow{name: name, version: version, ops: ops, names: names, outputIndex: outputIndex}, nil
 }

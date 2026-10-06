@@ -26,7 +26,7 @@ const schema = "growthbench"
 
 const claimProbe = `SELECT id FROM growthbench.workflow_runs
 WHERE queue='probe' AND workflow_name='probe' AND workflow_version=1
-  AND state='ready' AND next_run_at<=now() AND attempt<max_attempts
+  AND state='ready' AND next_run_at<=now()
 ORDER BY next_run_at,id LIMIT 16 FOR UPDATE SKIP LOCKED`
 
 const recoveryProbe = `SELECT id FROM growthbench.workflow_runs
@@ -147,14 +147,14 @@ func seedHistory(ctx context.Context, db *pgxpool.Pool, from, to int) error {
 	for first := from; first <= to; first += 100000 {
 		last := min(first+99999, to)
 		_, err := db.Exec(ctx, `INSERT INTO growthbench.workflow_runs
-			(id,workflow_name,workflow_version,queue,state,step_index,attempt,max_attempts,next_run_at,input_json,output_json,idempotency_key)
-			SELECT 'history-'||g,'history',1,'short','completed',1,0,25,now(),'{}'::jsonb,'true'::jsonb,'dedup-'||g
+			(id,workflow_name,workflow_version,queue,state,step_index,attempt,max_attempts,next_run_at,input_json,output_json,dedup_key)
+			SELECT md5('history-'||g)::uuid,'history',1,'short','completed',1,0,25,now(),'{}'::jsonb,'true'::jsonb,'dedup-'||g
 			FROM generate_series($1::int,$2::int) g`, first, last)
 		if err != nil {
 			return err
 		}
-		_, err = db.Exec(ctx, `INSERT INTO growthbench.step_checkpoints (run_id,step_key,value_json)
-			SELECT 'history-'||g,'process','true'::jsonb FROM generate_series($1::int,$2::int) g`, first, last)
+		_, err = db.Exec(ctx, `INSERT INTO growthbench.step_checkpoints (run_id,step_index,value_json)
+			SELECT md5('history-'||g)::uuid,0,'true'::jsonb FROM generate_series($1::int,$2::int) g`, first, last)
 		if err != nil {
 			return err
 		}
@@ -251,7 +251,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	if err = short.Init(ctx); err != nil {
+	if err = short.ApplySchema(ctx); err != nil {
 		return err
 	}
 	if _, err = db.Exec(ctx, "CREATE EXTENSION IF NOT EXISTS pgstattuple"); err != nil {

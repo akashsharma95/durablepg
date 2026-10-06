@@ -2,7 +2,6 @@ package durablepg
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -37,11 +36,16 @@ func (tr architectureQueryTrace) TraceQueryEnd(ctx context.Context, _ *pgx.Conn,
 
 func architectureWorker(t *testing.T, producer *Engine, tracer pgx.QueryTracer) (*Engine, *pgxpool.Pool) {
 	t.Helper()
+	return architectureWorkerWith(t, producer, func(cfg *pgxpool.Config) { cfg.ConnConfig.Tracer = tracer })
+}
+
+func architectureWorkerWith(t *testing.T, producer *Engine, configure func(*pgxpool.Config)) (*Engine, *pgxpool.Pool) {
+	t.Helper()
 	cfg, err := pgxpool.ParseConfig(os.Getenv("DURABLEPG_TEST_DATABASE_URL"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg.ConnConfig.Tracer = tracer
+	configure(cfg)
 	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -79,107 +83,79 @@ func architectureStopWorker(t *testing.T, cancel context.CancelFunc, done <-chan
 	}
 }
 
-// The first worker misses the event, but its lookup cannot return until the
-// producer has committed. The first worker then loses its next completion (or
-// the old post-commit race check) as if interrupted. A restarted worker must
-// still finish without another emission, including when no waiter existed at
-// the moment EmitEvent scanned registrations.
-func TestIntegrationEventBetweenLookupAndWaitSurvivesRestart(t *testing.T) {
-	producer, pool := integrationEngine(t)
-	const key = "event-during-registration"
-	build := func(b *Builder) { b.WaitEvent(key, time.Hour) }
-	producer.RegisterWorkflow("event_restart", build)
+// The waiter-registration race: an event committed while the worker is
+// blocked on the key lock must be seen by the worker's lookup, so the run is
+// not parked until its timeout.
+func TestIntegrationEventCommittedWhileWaiterBlocksOnLockIsDelivered(t *testing.T) {
+	producer, _ := integrationEngine(t)
+	worker, pool := architectureWorkerWith(t, producer, func(*pgxpool.Config) {})
+	defer pool.Close()
+	eventCommittedDuringLockWaitIsDelivered(t, producer, worker)
+}
 
-	lookupDone := make(chan struct{})
-	resumeLookup := make(chan struct{})
-	interrupted := make(chan struct{})
-	resumeInterrupt := make(chan struct{})
-	lookupRelease := sync.OnceFunc(func() { close(resumeLookup) })
-	interruptRelease := sync.OnceFunc(func() { close(resumeInterrupt) })
-	var firstLookup atomic.Bool
-	type lookupMark struct{}
-	trace := architectureQueryTrace{
-		start: func(ctx context.Context, data pgx.TraceQueryStartData) context.Context {
-			if strings.Contains(data.SQL, "SELECT EXISTS") && strings.Contains(data.SQL, "event_log") && firstLookup.CompareAndSwap(false, true) {
-				return context.WithValue(ctx, lookupMark{}, true)
-			}
-			// Force a crash at the old, post-commit rescue path. The new path
-			// has already advanced its cursor and instead reaches completion.
-			if strings.Contains(data.SQL, "SET state = 'completed'") ||
-				(strings.Contains(data.SQL, "UPDATE ") && strings.Contains(data.SQL, "event_log") && strings.Contains(data.SQL, "EXISTS (")) {
-				close(interrupted)
-				<-resumeInterrupt
-				canceled, cancel := context.WithCancel(ctx)
-				cancel()
-				return canceled
-			}
-			return ctx
-		},
-		end: func(ctx context.Context, _ pgx.TraceQueryEndData) {
-			if ctx.Value(lookupMark{}) != nil {
-				close(lookupDone)
-				<-resumeLookup
-			}
-		},
-	}
-	first, firstPool := architectureWorker(t, producer, trace)
-	first.RegisterWorkflow("event_restart", build)
-	defer firstPool.Close()
+// The race protocol needs each statement's snapshot to start after the key
+// lock. Under a REPEATABLE READ default the snapshot is taken by the lock
+// statement itself, before the lock is granted, so the engine must pin READ
+// COMMITTED or the run parks after the event and is never woken.
+func TestIntegrationWaitRaceHoldsUnderRepeatableReadDefault(t *testing.T) {
+	producer, _ := integrationEngine(t)
+	worker, pool := architectureWorkerWith(t, producer, func(cfg *pgxpool.Config) {
+		cfg.ConnConfig.RuntimeParams["default_transaction_isolation"] = "repeatable read"
+	})
+	defer pool.Close()
+	eventCommittedDuringLockWaitIsDelivered(t, producer, worker)
+}
 
-	runID, err := producer.Run(context.Background(), "event_restart", nil)
+func eventCommittedDuringLockWaitIsDelivered(t *testing.T, producer, worker *Engine) {
+	t.Helper()
+	ctx := context.Background()
+	build := func(b *Builder) { b.WaitEvent("signal", "race-key", time.Minute) }
+	producer.RegisterWorkflow("race", build)
+	worker.RegisterWorkflow("race", build)
+
+	// Hold the key lock and write an event in an open transaction, as a
+	// concurrent emitter would.
+	emitter, err := producer.db.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- first.StartWorker(ctx) }()
-	stopped := false
-	defer func() {
-		lookupRelease()
-		interruptRelease()
-		if !stopped {
-			architectureStopWorker(t, cancel, done)
-		}
-	}()
-
-	architectureSignal(t, lookupDone, "initial event miss")
-	if err := producer.EmitEvent(context.Background(), key, "retained"); err != nil {
+	defer emitter.Rollback(ctx) //nolint:errcheck
+	if _, err := emitter.Exec(ctx, producer.sql.lockEventKey, producer.schema, "race-key"); err != nil {
 		t.Fatal(err)
 	}
-	lookupRelease()
-	architectureSignal(t, interrupted, "interrupted first worker")
-	cancel()
-	interruptRelease()
-	architectureStopWorker(t, cancel, done)
-	stopped = true
-
-	var state string
-	if err := pool.QueryRow(context.Background(), fmt.Sprintf("SELECT state FROM %s WHERE id = $1", producer.table("workflow_runs")), string(runID)).Scan(&state); err != nil {
+	insert := fmt.Sprintf("INSERT INTO %s (event_key, payload_json, expires_at) VALUES ('race-key', '7', now() + interval '1 hour')", producer.table("event_log"))
+	if _, err := emitter.Exec(ctx, insert); err != nil {
 		t.Fatal(err)
 	}
-	if state == "completed" {
-		t.Fatal("first worker completed despite the injected interruption")
+
+	stop := startTestWorker(t, worker)
+	defer stop()
+	runID, err := producer.Run(ctx, "race", nil)
+	if err != nil {
+		t.Fatal(err)
 	}
-	// A process lost while its completion query is in flight leaves a lease.
-	// Expire and recover it explicitly instead of waiting for the test worker's
-	// two-second TTL plus the next periodic maintenance pass.
-	if state == "leased" {
-		expire := fmt.Sprintf("UPDATE %s SET lease_until = now() - interval '1 second' WHERE id = $1", producer.table("workflow_runs"))
-		if _, err := pool.Exec(context.Background(), expire, string(runID)); err != nil {
-			t.Fatal(err)
-		}
-		if err := producer.recoverExpiredLeases(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-		due := fmt.Sprintf("UPDATE %s SET next_run_at = now() - interval '1 second' WHERE id = $1 AND state = 'ready'", producer.table("workflow_runs"))
-		if _, err := pool.Exec(context.Background(), due, string(runID)); err != nil {
-			t.Fatal(err)
-		}
+	waitRunState(t, producer, runID, "leased")
+	time.Sleep(200 * time.Millisecond)
+	if st, err := producer.RunStatus(ctx, runID); err != nil || st.State != RunLeased {
+		t.Fatalf("worker must block on the key lock: %+v, %v", st, err)
+	}
+	if err := emitter.Commit(ctx); err != nil {
+		t.Fatal(err)
 	}
 
-	restarted := startTestWorker(t, producer)
-	defer restarted()
 	waitRunState(t, producer, runID, "completed")
+	// A retry could also deliver the event, but the protocol must not need one:
+	// a parked run would only be found again at its timeout.
+	st, err := producer.RunStatus(ctx, runID)
+	if err != nil || st.Attempt != 0 {
+		t.Fatalf("delivered after a failed attempt: %+v, %v", st, err)
+	}
+	var outcome struct {
+		Received int `json:"received"`
+	}
+	if ok, err := producer.RunOutput(ctx, runID, &outcome); err != nil || !ok || outcome.Received != 7 {
+		t.Fatalf("output = %+v, %v, %v; want received 7", outcome, ok, err)
+	}
 }
 
 // A checkpoint left at the current cursor by an older or interrupted worker
@@ -205,29 +181,25 @@ func TestIntegrationCheckpointAtCursorRecoversCanonicalOutput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	query := fmt.Sprintf("INSERT INTO %s (run_id, step_key, value_json) VALUES ($1, $2, $3::jsonb)", e.table("step_checkpoints"))
-	if _, err := pool.Exec(context.Background(), query, string(runID), formatStepKey(0, "charged"), `"canonical"`); err != nil {
+	query := fmt.Sprintf("INSERT INTO %s (run_id, step_index, value_json) VALUES ($1, 0, $2::jsonb)", e.table("step_checkpoints"))
+	if _, err := pool.Exec(context.Background(), query, string(runID), `"canonical"`); err != nil {
 		t.Fatal(err)
 	}
 	stop := startTestWorker(t, e)
 	defer stop()
 	waitRunState(t, e, runID, "completed")
-	var output []byte
-	if err := pool.QueryRow(context.Background(), fmt.Sprintf("SELECT output_json FROM %s WHERE id = $1", e.table("workflow_runs")), string(runID)).Scan(&output); err != nil {
+	var output string
+	if _, err := e.RunOutput(context.Background(), runID, &output); err != nil {
 		t.Fatal(err)
 	}
-	var result map[string]string
-	if err := json.Unmarshal(output, &result); err != nil {
-		t.Fatal(err)
-	}
-	if called.Load() != 0 || result["charged"] != "canonical" || result["receipt"] != "receipt:canonical" {
-		t.Fatalf("checkpoint recovery invoked callback %d times, output %s", called.Load(), output)
+	if called.Load() != 0 || output != "receipt:canonical" {
+		t.Fatalf("checkpoint recovery invoked callback %d times, output %q", called.Load(), output)
 	}
 }
 
-// Pause after the database has committed the checkpoint but before the old
-// owner proceeds. Replacing the lease must fence that owner, and recovery of
-// the committed step must produce its canonical result without reexecution.
+// Pause after the database has committed the first checkpoint but before the
+// old owner proceeds. Replacing the lease must fence that owner, and recovery
+// of the committed step must use its canonical result without reexecution.
 func TestIntegrationAtomicCheckpointCommitFencesStaleOwner(t *testing.T) {
 	producer, pool := integrationEngine(t)
 	var called atomic.Int32
@@ -235,6 +207,11 @@ func TestIntegrationAtomicCheckpointCommitFencesStaleOwner(t *testing.T) {
 		b.Step("charge", func(context.Context, *StepContext) (any, error) {
 			called.Add(1)
 			return "canonical", nil
+		})
+		b.Step("receipt", func(_ context.Context, sc *StepContext) (any, error) {
+			var charged string
+			err := sc.StepResult("charge", &charged)
+			return "receipt:" + charged, err
 		})
 	}
 	producer.RegisterWorkflow("atomic_checkpoint", build)
@@ -245,8 +222,8 @@ func TestIntegrationAtomicCheckpointCommitFencesStaleOwner(t *testing.T) {
 	type commitMark struct{}
 	trace := architectureQueryTrace{
 		start: func(ctx context.Context, data pgx.TraceQueryStartData) context.Context {
-			if strings.Contains(data.SQL, "step_checkpoints") && strings.Contains(data.SQL, "workflow_runs") &&
-				strings.Contains(data.SQL, "INSERT") && firstCommit.CompareAndSwap(false, true) {
+			// The step commit; maintenance also inserts checkpoints for timeouts.
+			if strings.Contains(data.SQL, "owned AS MATERIALIZED") && firstCommit.CompareAndSwap(false, true) {
 				return context.WithValue(ctx, commitMark{}, true)
 			}
 			return ctx
@@ -280,15 +257,15 @@ func TestIntegrationAtomicCheckpointCommitFencesStaleOwner(t *testing.T) {
 
 	var cursor int
 	var canonical string
-	query := fmt.Sprintf(`SELECT wr.step_index, cp.value_json FROM %s wr JOIN %s cp ON cp.run_id = wr.id WHERE wr.id = $1 AND cp.step_key = $2`,
+	query := fmt.Sprintf(`SELECT wr.step_index, cp.value_json FROM %s wr JOIN %s cp ON cp.run_id = wr.id WHERE wr.id = $1 AND cp.step_index = 0`,
 		producer.table("workflow_runs"), producer.table("step_checkpoints"))
-	if err := pool.QueryRow(context.Background(), query, string(runID), formatStepKey(0, "charge")).Scan(&cursor, &canonical); err != nil {
+	if err := pool.QueryRow(context.Background(), query, string(runID)).Scan(&cursor, &canonical); err != nil {
 		t.Fatal(err)
 	}
 	if cursor != 1 || canonical != `"canonical"` {
 		t.Fatalf("checkpoint and cursor did not commit atomically: cursor=%d value=%s", cursor, canonical)
 	}
-	steal := fmt.Sprintf(`UPDATE %s SET lease_owner = 'replacement', lease_until = clock_timestamp() - INTERVAL '1 second' WHERE id = $1 AND state = 'leased'`, producer.table("workflow_runs"))
+	steal := fmt.Sprintf(`UPDATE %s SET lease_token = gen_random_uuid(), lease_until = clock_timestamp() - INTERVAL '1 second' WHERE id = $1 AND state = 'leased'`, producer.table("workflow_runs"))
 	if tag, err := pool.Exec(context.Background(), steal, string(runID)); err != nil {
 		t.Fatal(err)
 	} else if tag.RowsAffected() != 1 {
@@ -310,15 +287,11 @@ func TestIntegrationAtomicCheckpointCommitFencesStaleOwner(t *testing.T) {
 	stop := startTestWorker(t, producer)
 	defer stop()
 	waitRunState(t, producer, runID, "completed")
-	var output []byte
-	if err := pool.QueryRow(context.Background(), fmt.Sprintf("SELECT output_json FROM %s WHERE id = $1", producer.table("workflow_runs")), string(runID)).Scan(&output); err != nil {
+	var output string
+	if _, err := producer.RunOutput(context.Background(), runID, &output); err != nil {
 		t.Fatal(err)
 	}
-	var result map[string]string
-	if err := json.Unmarshal(output, &result); err != nil {
-		t.Fatal(err)
-	}
-	if called.Load() != 1 || result["charge"] != "canonical" {
-		t.Fatalf("stale-lease recovery invoked charge %d times, output %s", called.Load(), output)
+	if called.Load() != 1 || output != "receipt:canonical" {
+		t.Fatalf("stale-lease recovery invoked charge %d times, output %q", called.Load(), output)
 	}
 }

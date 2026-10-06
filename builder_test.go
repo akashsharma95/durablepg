@@ -39,9 +39,8 @@ func TestBuilderDuplicateStepPanics(t *testing.T) {
 
 func TestStepContextValue(t *testing.T) {
 	sc := &StepContext{
-		values: map[string]json.RawMessage{
-			"step_a": json.RawMessage(`{"n":42}`),
-		},
+		values: []json.RawMessage{json.RawMessage(`{"n":42}`)},
+		names:  map[string]int{"step_a": 0},
 	}
 	var out struct {
 		N int `json:"n"`
@@ -59,9 +58,8 @@ func TestStepContextStepResult(t *testing.T) {
 	sc := &StepContext{
 		RunID:    "run-123",
 		Workflow: "signup",
-		values: map[string]json.RawMessage{
-			"step_a": json.RawMessage(`{"n":42}`),
-		},
+		values:   []json.RawMessage{json.RawMessage(`{"n":42}`)},
+		names:    map[string]int{"step_a": 0},
 	}
 	var out struct {
 		N int `json:"n"`

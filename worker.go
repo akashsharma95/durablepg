@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"runtime/debug"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,16 +16,24 @@ import (
 
 var errLostLease = errors.New("durablepg: lease lost")
 
+const maxErrorLength = 4000
+
 type claimedRun struct {
-	ID            WorkflowID
-	WorkflowName  string
-	Version       int
-	StepIndex     int
-	Input         json.RawMessage
-	Attempt       int
-	MaxAttempts   int
-	LeaseOwner    string
-	leaseDeadline time.Time
+	ID           WorkflowID
+	WorkflowName string
+	Version      int
+	StepIndex    int
+	Input        json.RawMessage
+	Attempt      int
+	Token        string
+	// checkpoints maps operation indexes to stored results.
+	checkpoints map[int]json.RawMessage
+	deadline    time.Time
+}
+
+// querier is satisfied by both the pool and a transaction.
+type querier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
 // StartWorker polls and claims runs until ctx is canceled, then drains active
@@ -46,72 +53,67 @@ func (e *Engine) StartWorker(ctx context.Context) error {
 	}
 
 	g, dispatchCtx := errgroup.WithContext(ctx)
-	// Claimed work and its heartbeat outlive the dispatcher's cancellation while
+	// Claimed work and the heartbeat outlive the dispatcher's cancellation while
 	// shutdown drains. A bounded drain handles steps that ignore cancellation.
 	workCtx, cancelWork := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelWork()
-	if e.db.Config().MaxConns > 1 {
-		g.Go(func() error { return e.listenLoop(dispatchCtx, wake) })
-	}
+	leases := newLeaseTable()
+	g.Go(func() error { return e.listenLoop(dispatchCtx, wake) })
 	g.Go(func() error { return e.maintenanceLoop(dispatchCtx) })
 	g.Go(func() error { return e.retentionLoop(dispatchCtx) })
-	g.Go(func() error { return e.dispatchLoop(dispatchCtx, workCtx, cancelWork, wake) })
+	g.Go(func() error { return e.heartbeatLoop(workCtx, leases) })
+	g.Go(func() error { return e.dispatchLoop(dispatchCtx, workCtx, cancelWork, leases, wake) })
 	return g.Wait()
 }
 
+// listenLoop wakes dispatch on notifications for this worker's queue. It
+// holds its own connection outside the pool, so even a one-connection pool
+// keeps notifications. Notifications are hints; polling is the recovery path.
 func (e *Engine) listenLoop(ctx context.Context, wake chan<- struct{}) error {
+	signal := func() {
+		select {
+		case wake <- struct{}{}:
+		default:
+		}
+	}
 	for {
+		err := e.listen(ctx, signal)
 		if ctx.Err() != nil {
 			return nil
 		}
-
-		conn, err := e.db.Acquire(ctx)
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
-			e.logger.Error("acquire notification listener", "error", err)
-			time.Sleep(time.Second)
-			continue
-		}
-
-		_, err = conn.Exec(ctx, "LISTEN "+notifyChannel)
-		if err != nil {
-			conn.Release()
-			if ctx.Err() != nil {
-				return nil
-			}
-			e.logger.Error("listen for workflow notifications", "error", err)
-			time.Sleep(time.Second)
-			continue
-		}
-
-		for {
-			if ctx.Err() != nil {
-				conn.Release()
-				return nil
-			}
-
-			_, err := conn.Conn().WaitForNotification(ctx)
-			if err != nil {
-				break
-			}
-			select {
-			case wake <- struct{}{}:
-			default:
-			}
-		}
-
-		conn.Release()
-		if ctx.Err() != nil {
+		e.logger.Error("workflow notification listener", "error", err)
+		select {
+		case <-ctx.Done():
 			return nil
+		case <-time.After(time.Second):
 		}
-		e.logger.Error("workflow notification listener disconnected", "error", err)
-		time.Sleep(time.Second)
 	}
 }
 
-// maintenanceLoop recovers leases and waits independently of event retention.
+func (e *Engine) listen(ctx context.Context, signal func()) error {
+	conn, err := pgx.ConnectConfig(ctx, e.db.Config().ConnConfig.Copy())
+	if err != nil {
+		return fmt.Errorf("connect: %w", err)
+	}
+	defer conn.Close(context.Background()) //nolint:errcheck
+	if _, err := conn.Exec(ctx, "LISTEN "+quoteIdentifier(e.channel)); err != nil {
+		return fmt.Errorf("listen: %w", err)
+	}
+	// Work may have arrived while disconnected.
+	signal()
+	for {
+		note, err := conn.WaitForNotification(ctx)
+		if err != nil {
+			signal()
+			return err
+		}
+		if note.Payload == e.queue {
+			signal()
+		}
+	}
+}
+
+// maintenanceLoop recovers leases and times out waits independently of event retention.
 func (e *Engine) maintenanceLoop(ctx context.Context) error {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -121,7 +123,7 @@ func (e *Engine) maintenanceLoop(ctx context.Context) error {
 			e.logger.Error("recover expired workflow leases", "error", err)
 		}
 		if err := e.promoteTimedOutWaiters(ctx); err != nil && ctx.Err() == nil {
-			e.logger.Error("promote timed-out workflow waiters", "error", err)
+			e.logger.Error("promote timed-out workflow waits", "error", err)
 		}
 	}
 	maintain()
@@ -150,7 +152,116 @@ func (e *Engine) retentionLoop(ctx context.Context) error {
 	}
 }
 
-func (e *Engine) dispatchLoop(ctx, workCtx context.Context, cancelWork context.CancelFunc, wake chan struct{}) error {
+func (e *Engine) recoverExpiredLeases(ctx context.Context) error {
+	return batches(time.Now(), 8, maintenanceBatch, func() (int64, error) {
+		tag, err := e.db.Exec(ctx, e.sql.recoverLeases)
+		return tag.RowsAffected(), err
+	})
+}
+
+// promoteTimedOutWaiters records a timed-out outcome for expired waits and
+// makes their runs ready.
+func (e *Engine) promoteTimedOutWaiters(ctx context.Context) error {
+	return batches(time.Now(), 8, maintenanceBatch, func() (int64, error) {
+		var promoted, notified int64
+		err := e.db.QueryRow(ctx, e.sql.promoteTimedOut, e.channel).Scan(&promoted, &notified)
+		return promoted, err
+	})
+}
+
+// pruneExpiredEvents keeps each sweep bounded even if expired events arrive
+// faster than deletion; lease renewals share this pool.
+func (e *Engine) pruneExpiredEvents(ctx context.Context) error {
+	return batches(time.Now(), 64, pruneBatch, func() (int64, error) {
+		tag, err := e.db.Exec(ctx, e.sql.pruneEvents)
+		return tag.RowsAffected(), err
+	})
+}
+
+// batches repeats batch while it processes full batches, within a count and
+// a one-second budget, so a backlog cannot starve the pool.
+func batches(started time.Time, maxBatches int, size int64, batch func() (int64, error)) error {
+	for range maxBatches {
+		n, err := batch()
+		if err != nil {
+			return err
+		}
+		if n < size || time.Since(started) >= time.Second {
+			return nil
+		}
+	}
+	return nil
+}
+
+// heartbeatLoop renews all of this worker's leases every heartbeat interval
+// and cancels any claim whose last confirmed deadline passes without renewal.
+func (e *Engine) heartbeatLoop(ctx context.Context, leases *leaseTable) error {
+	nextRenewal := time.Now().Add(e.heartbeatEvery)
+	timer := time.NewTimer(e.heartbeatEvery)
+	defer timer.Stop()
+	for {
+		wakeAt := nextRenewal
+		if earliest, ok := leases.expire(time.Now()); ok && earliest.Before(wakeAt) {
+			wakeAt = earliest
+		}
+		timer.Reset(time.Until(wakeAt))
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-timer.C:
+		}
+		now := time.Now()
+		if now.Before(nextRenewal) {
+			continue
+		}
+		nextRenewal = now.Add(e.heartbeatEvery)
+		// Recomputed here: claims taken during the sleep are not in wakeAt.
+		earliest, ok := leases.expire(now)
+		runIDs, tokens := leases.snapshot()
+		if len(tokens) == 0 {
+			continue
+		}
+		// Never wait for a renewal past the earliest confirmed deadline.
+		bound := now.Add(e.leaseTTL)
+		if ok {
+			bound = earliest
+		}
+		renewCtx, stop := context.WithDeadline(ctx, bound)
+		renewed, err := e.renewLeases(renewCtx, runIDs, tokens)
+		stop()
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			// Transient failures are tolerated until each lease's deadline.
+			e.logger.Warn("renew workflow leases", "error", err)
+			continue
+		}
+		leases.applyRenewal(tokens, renewed, now.Add(e.leaseTTL))
+	}
+}
+
+func (e *Engine) renewLeases(ctx context.Context, runIDs, tokens []string) (map[string]struct{}, error) {
+	rows, err := e.db.Query(ctx, e.sql.renewLeases, runIDs, tokens, e.leaseTTL.Milliseconds())
+	if err != nil {
+		return nil, err
+	}
+	renewed := make(map[string]struct{}, len(tokens))
+	for rows.Next() {
+		var token string
+		if err := rows.Scan(&token); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		renewed[token] = struct{}{}
+	}
+	return renewed, rows.Err()
+}
+
+func (e *Engine) dispatchLoop(ctx, workCtx context.Context, cancelWork context.CancelFunc, leases *leaseTable, wake chan struct{}) error {
+	// The heartbeat stops once dispatch returns: claims have either drained or
+	// been abandoned.
+	defer cancelWork()
 	var wg sync.WaitGroup
 	var inFlight atomic.Int64
 
@@ -176,8 +287,10 @@ func (e *Engine) dispatchLoop(ctx, workCtx context.Context, cancelWork context.C
 			inFlight.Add(1)
 			e.activeClaims.Add(1)
 			run := runs[i]
+			runCtx, release := leases.insert(workCtx, string(run.ID), run.Token, run.deadline)
 			wg.Go(func() {
 				defer func() {
+					release()
 					inFlight.Add(-1)
 					select {
 					case wake <- struct{}{}:
@@ -185,8 +298,8 @@ func (e *Engine) dispatchLoop(ctx, workCtx context.Context, cancelWork context.C
 					}
 					e.activeClaims.Done()
 				}()
-				if err := e.executeClaim(workCtx, run); err != nil && !errors.Is(err, errLostLease) && workCtx.Err() == nil {
-					e.logger.Error("execute workflow claim", "run_id", run.ID, "workflow", run.WorkflowName, "version", run.Version, "error", err)
+				if err := e.executeClaim(runCtx, run); err != nil {
+					e.logger.Error("record workflow run failure", "run_id", run.ID, "workflow", run.WorkflowName, "version", run.Version, "error", err)
 				}
 			})
 		}
@@ -201,10 +314,7 @@ func (e *Engine) dispatchLoop(ctx, workCtx context.Context, cancelWork context.C
 				wg.Wait()
 				close(done)
 			}()
-			drainTimeout := e.leaseTTL
-			if drainTimeout < 5*time.Second {
-				drainTimeout = 5 * time.Second
-			}
+			drainTimeout := max(e.leaseTTL, 5*time.Second)
 			timer := time.NewTimer(drainTimeout)
 			defer timer.Stop()
 			select {
@@ -212,7 +322,6 @@ func (e *Engine) dispatchLoop(ctx, workCtx context.Context, cancelWork context.C
 			case <-timer.C:
 				// Noncooperative user code cannot be killed. Cancel the heartbeat
 				// and fence all writes; the run is recovered when the lease expires.
-				cancelWork()
 			}
 			return nil
 		case <-ticker.C:
@@ -233,54 +342,45 @@ func (e *Engine) claimReadyRuns(ctx context.Context, limit int) ([]claimedRun, e
 	}
 	// A single supported definition is common in isolated queues. Equality
 	// predicates let PostgreSQL use workflow_runs_selective_ready_idx directly.
-	predicate := `EXISTS (SELECT 1 FROM unnest($5::text[], $6::integer[]) AS supported(name, version)
-	              WHERE supported.name = workflow_name AND supported.version = workflow_version)`
+	query := e.sql.claimMulti
 	var nameArg, versionArg any = names, versions
 	if len(names) == 1 {
-		predicate = "workflow_name = $5 AND workflow_version = $6"
+		query = e.sql.claimSingle
 		nameArg, versionArg = names[0], versions[0]
 	}
-	query := fmt.Sprintf(`
-WITH picked AS (
-	SELECT id
-	FROM %s
-	WHERE queue = $1
-	  AND %s
-	  AND state = 'ready'
-	  AND next_run_at <= now()
-	  AND attempt < max_attempts
-	ORDER BY next_run_at, id
-	LIMIT $2
-	FOR UPDATE SKIP LOCKED
-)
-UPDATE %s wr
-SET state = 'leased',
-	lease_owner = $3 || ':' || md5(random()::text || clock_timestamp()::text || picked.id),
-	lease_until = clock_timestamp() + ($4::bigint * INTERVAL '1 millisecond'),
-	updated_at = now()
-FROM picked
-WHERE wr.id = picked.id
-RETURNING wr.id, wr.workflow_name, wr.workflow_version, wr.step_index, wr.input_json, wr.attempt, wr.max_attempts, wr.lease_owner;
-`, e.table("workflow_runs"), predicate, e.table("workflow_runs"))
 
 	started := time.Now()
-	rows, err := e.db.Query(ctx, query, e.queue, limit, e.workerID, e.leaseTTL.Milliseconds(), nameArg, versionArg)
+	rows, err := e.db.Query(ctx, query, e.queue, limit, e.leaseTTL.Milliseconds(), nameArg, versionArg)
 	if err != nil {
 		return nil, fmt.Errorf("durablepg: claim runs: %w", err)
 	}
 	defer rows.Close()
 
+	// The database set lease_until after started, so this is conservative.
+	deadline := started.Add(e.leaseTTL)
 	runs := make([]claimedRun, 0, limit)
 	for rows.Next() {
 		var run claimedRun
 		var runID string
-		var input []byte
-		if err := rows.Scan(&runID, &run.WorkflowName, &run.Version, &run.StepIndex, &input, &run.Attempt, &run.MaxAttempts, &run.LeaseOwner); err != nil {
+		var input, checkpoints []byte
+		if err := rows.Scan(&runID, &run.WorkflowName, &run.Version, &run.StepIndex, &run.Attempt, &run.Token, &input, &checkpoints); err != nil {
 			return nil, fmt.Errorf("durablepg: scan claimed run: %w", err)
+		}
+		var raw [][2]json.RawMessage
+		if err := json.Unmarshal(checkpoints, &raw); err != nil {
+			return nil, fmt.Errorf("durablepg: decode checkpoints: %w", err)
+		}
+		run.checkpoints = make(map[int]json.RawMessage, len(raw))
+		for _, pair := range raw {
+			var index int
+			if err := json.Unmarshal(pair[0], &index); err != nil {
+				return nil, fmt.Errorf("durablepg: decode checkpoint index: %w", err)
+			}
+			run.checkpoints[index] = pair[1]
 		}
 		run.ID = WorkflowID(runID)
 		run.Input = append([]byte(nil), input...)
-		run.leaseDeadline = started.Add(time.Duration(e.leaseTTL.Milliseconds()) * time.Millisecond)
+		run.deadline = deadline
 		runs = append(runs, run)
 	}
 	if err := rows.Err(); err != nil {
@@ -289,691 +389,199 @@ RETURNING wr.id, wr.workflow_name, wr.workflow_version, wr.step_index, wr.input_
 	return runs, nil
 }
 
+// executeClaim drives a run and records a failure. Lost leases, cancellation,
+// and abandoned claims write nothing; it returns only failures to record one.
 func (e *Engine) executeClaim(ctx context.Context, run claimedRun) error {
+	err := e.drive(ctx, run)
+	if err == nil || errors.Is(err, errLostLease) || ctx.Err() != nil {
+		return nil
+	}
+	return e.failOrRetry(ctx, run, err)
+}
+
+func (e *Engine) drive(ctx context.Context, run claimedRun) error {
 	wf, ok := e.workflow(run.WorkflowName, run.Version)
 	if !ok || wf == nil {
-		// A definition may have been unregistered after the claim's registry snapshot.
+		// Claims filter on registered definitions; leave it for lease recovery.
 		return errLostLease
 	}
-
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	var lostLease atomic.Bool
-	hbDone := make(chan struct{})
-	go func() {
-		defer close(hbDone)
-		e.heartbeatLoop(runCtx, run, &lostLease, cancel)
-	}()
-	defer func() {
-		cancel()
-		<-hbDone
-	}()
-
-	values, err := e.loadStepValues(runCtx, run.ID)
-	if err != nil {
-		if runCtx.Err() != nil {
-			return nil
+	values := make([]json.RawMessage, len(wf.ops))
+	for index, raw := range run.checkpoints {
+		if index >= 0 && index < len(values) {
+			values[index] = raw
 		}
-		return e.failOrRetry(runCtx, run, err)
 	}
-
-	index := run.StepIndex
-	for index < len(wf.ops) {
-		if runCtx.Err() != nil {
-			if lostLease.Load() || ctx.Err() != nil {
-				return nil
-			}
-			return runCtx.Err()
+	last := len(wf.ops) - 1
+	for index := run.StepIndex; index < len(wf.ops); index++ {
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
-
+		// A checkpoint at the cursor was committed by an earlier claim (or an
+		// event delivery) whose cursor update this claim has not seen yet.
+		if values[index] != nil {
+			continue
+		}
+		complete := index == last
 		op := wf.ops[index]
 		switch op.kind {
 		case opStep:
-			err := e.runStep(runCtx, run, index, op.step, values)
+			raw, err := runStep(ctx, e.stepContext(run, wf, values, index, op.step.name), op.step)
 			if err != nil {
-				if errors.Is(err, errLostLease) || lostLease.Load() || runCtx.Err() != nil {
-					return nil
-				}
-				return e.failOrRetry(runCtx, run, err)
+				return err
 			}
-			index++
+			if values[index], err = e.commitStep(ctx, e.db, run, index, raw, complete); err != nil {
+				return err
+			}
 		case opSleep:
-			err := e.parkForSleep(runCtx, run, index+1, op.sleep)
-			if err != nil && !errors.Is(err, errLostLease) && runCtx.Err() == nil {
-				return e.failOrRetry(runCtx, run, err)
-			}
-			return nil
+			return e.parkForSleep(ctx, run, index+1, op.sleep)
 		case opWaitEvent:
-			key, err := resolveWaitKey(run, op.wait, values)
+			key, err := op.wait.resolve(e.stepContext(run, wf, values, index, op.wait.name))
 			if err != nil {
-				if runCtx.Err() != nil {
-					return nil
-				}
-				return e.failOrRetry(runCtx, run, err)
+				return err
 			}
-			waiting, err := e.parkForEvent(runCtx, run, index+1, key, op.wait.timeout)
-			if err != nil {
-				if errors.Is(err, errLostLease) || lostLease.Load() || runCtx.Err() != nil {
-					return nil
-				}
-				return e.failOrRetry(runCtx, run, err)
+			raw, err := e.waitForEvent(ctx, run, index, key, op.wait.timeout, complete)
+			if err != nil || raw == nil {
+				return err
 			}
-			if waiting {
-				return nil
-			}
-			index++
+			values[index] = raw
 		default:
-			return e.failOrRetry(runCtx, run, fmt.Errorf("unsupported operation kind %d", op.kind))
+			return fmt.Errorf("unsupported operation kind %d", op.kind)
+		}
+		if complete {
+			return nil
 		}
 	}
-
-	if lostLease.Load() || runCtx.Err() != nil {
-		return nil
+	var output json.RawMessage
+	if wf.outputIndex >= 0 {
+		output = values[wf.outputIndex]
 	}
-	return e.completeRun(runCtx, run, values)
+	tag, err := e.db.Exec(ctx, e.sql.completeRun, string(run.ID), run.Token, len(wf.ops), output)
+	if err != nil {
+		return fmt.Errorf("durablepg: complete run: %w", err)
+	}
+	return fenced(tag.RowsAffected())
 }
 
-func resolveWaitKey(run claimedRun, wait *waitEventOp, values map[string]json.RawMessage) (string, error) {
-	if wait == nil {
-		return "", errors.New("durablepg: nil wait operation")
-	}
-	return wait.resolve(&StepContext{
-		RunID: run.ID, Workflow: run.WorkflowName,
-		Input: run.Input, values: cloneValues(values),
-	})
-}
-
-func (e *Engine) heartbeatLoop(ctx context.Context, run claimedRun, lost *atomic.Bool, cancel context.CancelFunc) {
-	ticker := time.NewTicker(e.heartbeatEvery)
-	defer ticker.Stop()
-	deadline := run.leaseDeadline
-	timer := time.NewTimer(time.Until(deadline))
-	defer timer.Stop()
-
-	query := fmt.Sprintf(`
-UPDATE %s
-SET lease_until = clock_timestamp() + ($2::bigint * INTERVAL '1 millisecond'),
-	updated_at = now()
-WHERE id = $1
-  AND state = 'leased'
-  AND lease_owner = $3
-  AND lease_until > clock_timestamp();
-`, e.table("workflow_runs"))
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-timer.C:
-			lost.Store(true)
-			cancel()
-			return
-		case <-ticker.C:
-			started := time.Now()
-			// Never wait for a renewal past the last confirmed lease deadline.
-			renewCtx, stopRenew := context.WithDeadline(ctx, deadline)
-			tag, err := e.db.Exec(renewCtx, query, string(run.ID), e.leaseTTL.Milliseconds(), run.LeaseOwner)
-			stopRenew()
-			if ctx.Err() != nil {
-				return
-			}
-			if !time.Now().Before(deadline) {
-				lost.Store(true)
-				cancel()
-				return
-			}
-			if err != nil {
-				// Transient uncertainty is safe only until the confirmed deadline.
-				continue
-			}
-			if tag.RowsAffected() == 0 {
-				lost.Store(true)
-				cancel()
-				return
-			}
-			deadline = started.Add(time.Duration(e.leaseTTL.Milliseconds()) * time.Millisecond)
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			timer.Reset(time.Until(deadline))
-		}
-	}
-}
-
-func (e *Engine) runStep(ctx context.Context, run claimedRun, index int, step *stepOp, values map[string]json.RawMessage) error {
-	if step == nil {
-		return fmt.Errorf("durablepg: nil step at index %d", index)
-	}
-	if _, ok := values[step.name]; ok {
-		return e.advanceStep(ctx, run, index+1)
-	}
-
-	stepKey := formatStepKey(index, step.name)
-
-	sc := &StepContext{
+// stepContext snapshots completed values so a retained context cannot see
+// later results.
+func (e *Engine) stepContext(run claimedRun, wf *compiledWorkflow, values []json.RawMessage, index int, name string) *StepContext {
+	return &StepContext{
 		RunID:    run.ID,
 		Workflow: run.WorkflowName,
-		StepKey:  stepKey,
+		StepKey:  fmt.Sprintf("%d:%s", index, name),
 		Input:    run.Input,
-		values:   cloneValues(values),
+		values:   append([]json.RawMessage(nil), values[:index]...),
+		names:    wf.names,
 	}
+}
 
+func runStep(ctx context.Context, sc *StepContext, step *stepOp) (json.RawMessage, error) {
 	execCtx := ctx
-	cancel := func() {}
 	if step.opts.timeout > 0 {
+		var cancel context.CancelFunc
 		execCtx, cancel = context.WithTimeout(ctx, step.opts.timeout)
+		defer cancel()
 	}
-	defer cancel()
-
 	out, err := executeStepSafely(execCtx, step.name, step.fn, sc)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	raw, err := json.Marshal(out)
 	if err != nil {
-		return fmt.Errorf("durablepg: marshal step %q output: %w", step.name, err)
+		return nil, fmt.Errorf("durablepg: marshal step %q output: %w", step.name, err)
 	}
-	raw, err = e.commitStep(execCtx, run, index, stepKey, raw)
-	if err != nil {
-		return err
-	}
-	values[step.name] = raw
-	return nil
+	return raw, nil
 }
 
-func (e *Engine) advanceStep(ctx context.Context, run claimedRun, nextIndex int) error {
-	query := fmt.Sprintf(`
-UPDATE %s
-SET step_index = $2,
-	updated_at = now(),
-	last_error = NULL,
-	lease_failures = 0
-WHERE id = $1
-  AND state = 'leased'
-  AND lease_owner = $3
-  AND lease_until > clock_timestamp();
-`, e.table("workflow_runs"))
-	tag, err := e.db.Exec(ctx, query, string(run.ID), nextIndex, run.LeaseOwner)
-	if err != nil {
-		return fmt.Errorf("durablepg: advance step: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return errLostLease
-	}
-	return nil
-}
-
-func (e *Engine) parkForSleep(ctx context.Context, run claimedRun, nextIndex int, d time.Duration) error {
-	query := fmt.Sprintf(`
-UPDATE %s
-SET state = 'ready',
-	step_index = $2,
-	next_run_at = now() + ($3::bigint * INTERVAL '1 millisecond'),
-	lease_owner = NULL,
-	lease_until = NULL,
-	updated_at = now(),
-	last_error = NULL,
-	lease_failures = 0
-WHERE id = $1
-  AND state = 'leased'
-  AND lease_owner = $4
-  AND lease_until > clock_timestamp();
-`, e.table("workflow_runs"))
-	tag, err := e.db.Exec(ctx, query, string(run.ID), nextIndex, d.Milliseconds(), run.LeaseOwner)
-	if err != nil {
-		return fmt.Errorf("durablepg: park for sleep: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return errLostLease
-	}
-	e.notifyWakeup(ctx, e.queue)
-	return nil
-}
-
-func (e *Engine) parkForEvent(ctx context.Context, run claimedRun, nextIndex int, key string, timeout time.Duration) (bool, error) {
-	exists, err := e.eventExists(ctx, key)
-	if err != nil {
-		return false, err
-	}
-	if exists {
-		if err := e.advanceStep(ctx, run, nextIndex); err != nil {
-			return false, err
-		}
-		return false, nil
-	}
-
-	deadline := time.Now().UTC().Add(timeout)
-	tx, err := e.db.Begin(ctx)
-	if err != nil {
-		return false, fmt.Errorf("durablepg: begin wait tx: %w", err)
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck
-	// Serialize event publication and waiter registration for this key.
-	// The existence check must run after acquiring the lock, in a fresh
-	// READ COMMITTED statement, so a published event or a committed waiter
-	// is always visible to one side of the protocol.
-	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1::text), hashtext($2::text))", e.schema, key); err != nil {
-		return false, fmt.Errorf("durablepg: lock event key: %w", err)
-	}
-	query := fmt.Sprintf(`SELECT EXISTS (
-	SELECT 1 FROM %s
-	WHERE event_key = $1 AND (expires_at IS NULL OR expires_at > now())
-);`, e.table("event_log"))
-	if err := tx.QueryRow(ctx, query, key).Scan(&exists); err != nil {
-		return false, fmt.Errorf("durablepg: recheck event under lock: %w", err)
-	}
-	if exists {
-		if err := tx.Commit(ctx); err != nil {
-			return false, fmt.Errorf("durablepg: commit event check: %w", err)
-		}
-		return false, e.advanceStep(ctx, run, nextIndex)
-	}
-
-	insertWaiter := fmt.Sprintf(`
-INSERT INTO %s (event_key, run_id, deadline, created_at)
-VALUES ($1, $2, $3, now())
-ON CONFLICT (event_key, run_id)
-DO UPDATE SET deadline = EXCLUDED.deadline;
-`, e.table("waiters"))
-	if _, err := tx.Exec(ctx, insertWaiter, key, string(run.ID), deadline); err != nil {
-		return false, fmt.Errorf("durablepg: insert waiter: %w", err)
-	}
-
-	updateRun := fmt.Sprintf(`
-UPDATE %s
-SET state = 'waiting_event',
-	step_index = $2,
-	waiting_event_key = $3,
-	waiting_deadline = $4,
-	lease_owner = NULL,
-	lease_until = NULL,
-	updated_at = now(),
-	lease_failures = 0
-WHERE id = $1
-  AND state = 'leased'
-  AND lease_owner = $5
-  AND lease_until > clock_timestamp();
-`, e.table("workflow_runs"))
-	tag, err := tx.Exec(ctx, updateRun, string(run.ID), nextIndex, key, deadline, run.LeaseOwner)
-	if err != nil {
-		return false, fmt.Errorf("durablepg: set waiting_event state: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return false, errLostLease
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return false, fmt.Errorf("durablepg: commit wait tx: %w", err)
-	}
-
-	// Close registration races where the event committed during wait setup.
-	// Once the lease is released, the heartbeat can cancel the execution
-	// context. The race-closing wakeup must still finish independently.
-	wakeCtx, cancelWake := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-	defer cancelWake()
-	_, err = e.wakeWaitingRunIfEventExists(wakeCtx, run.ID, key)
-	if err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-func (e *Engine) wakeWaitingRunIfEventExists(ctx context.Context, runID WorkflowID, key string) (bool, error) {
-	updateQuery := fmt.Sprintf(`
-UPDATE %s
-SET state = 'ready',
-	next_run_at = now(),
-	waiting_event_key = NULL,
-	waiting_deadline = NULL,
-	updated_at = now()
-WHERE id = $1
-  AND state = 'waiting_event'
-  AND waiting_event_key = $2
-  AND EXISTS (
-	  SELECT 1
-	  FROM %s
-	  WHERE event_key = $2
-	    AND (expires_at IS NULL OR expires_at > now())
-	  ORDER BY created_at DESC
-	  LIMIT 1
-  )
-RETURNING id;
-`, e.table("workflow_runs"), e.table("event_log"))
-	var awakenedID string
-	err := e.db.QueryRow(ctx, updateQuery, string(runID), key).Scan(&awakenedID)
-	if err != nil {
-		if isNoRows(err) {
-			return false, nil
-		}
-		return false, fmt.Errorf("durablepg: wake waiting run: %w", err)
-	}
-
-	cleanupQuery := fmt.Sprintf(`
-DELETE FROM %s
-WHERE run_id = $1
-  AND event_key = $2;
-`, e.table("waiters"))
-	if _, err := e.db.Exec(ctx, cleanupQuery, awakenedID, key); err != nil {
-		return false, fmt.Errorf("durablepg: cleanup waiter after wake: %w", err)
-	}
-	e.notifyWakeup(ctx, e.queue)
-	return true, nil
-}
-
-func (e *Engine) eventExists(ctx context.Context, key string) (bool, error) {
-	query := fmt.Sprintf(`
-SELECT EXISTS (
-	SELECT 1 FROM %s
-	WHERE event_key = $1 AND (expires_at IS NULL OR expires_at > now())
-);`, e.table("event_log"))
-	var exists bool
-	if err := e.db.QueryRow(ctx, query, key).Scan(&exists); err != nil {
-		return false, fmt.Errorf("durablepg: lookup event: %w", err)
-	}
-	return exists, nil
-}
-
-// commitStep locks the claim, saves the first result, and advances progress in
-// one statement. A checkpoint from an older worker may already exist at this
-// cursor; its value wins, including when a previous commit response was lost.
-func (e *Engine) commitStep(ctx context.Context, run claimedRun, index int, stepKey string, value []byte) (json.RawMessage, error) {
-	query := fmt.Sprintf(`
-WITH owned AS MATERIALIZED (
-	SELECT id FROM %s
-	WHERE id = $1 AND state = 'leased' AND lease_owner = $4
-	  AND lease_until > clock_timestamp() AND step_index = $5
-	FOR UPDATE
-), inserted AS (
-	INSERT INTO %s (run_id, step_key, value_json, completed_at)
-	SELECT id, $2, $3::jsonb, now() FROM owned
-	ON CONFLICT (run_id, step_key) DO NOTHING
-	RETURNING value_json
-), recorded AS (
-	SELECT value_json FROM inserted
-	UNION ALL
-	SELECT value_json FROM %s
-	WHERE run_id = $1 AND step_key = $2
-	  AND NOT EXISTS (SELECT 1 FROM inserted)
-), advanced AS (
-	UPDATE %s wr
-	SET step_index = $5 + 1, updated_at = now(),
-	    last_error = NULL, lease_failures = 0
-	FROM owned
-	WHERE wr.id = owned.id AND EXISTS (SELECT 1 FROM recorded)
-	RETURNING wr.id
-)
-SELECT value_json FROM recorded WHERE EXISTS (SELECT 1 FROM advanced);
-`, e.table("workflow_runs"), e.table("step_checkpoints"), e.table("step_checkpoints"), e.table("workflow_runs"))
-	var saved []byte
-	err := e.db.QueryRow(ctx, query, string(run.ID), stepKey, value, run.LeaseOwner, index).Scan(&saved)
+// commitStep saves the result at index and advances the cursor; with
+// complete, it also finishes the run. It returns the stored value, which is an
+// earlier claim's checkpoint if one already exists at this position.
+func (e *Engine) commitStep(ctx context.Context, q querier, run claimedRun, index int, value []byte, complete bool) (json.RawMessage, error) {
+	var existing []byte
+	err := q.QueryRow(ctx, e.sql.commitStep, string(run.ID), run.Token, index, value, complete).Scan(&existing)
 	if isNoRows(err) {
 		return nil, errLostLease
 	}
 	if err != nil {
 		return nil, fmt.Errorf("durablepg: commit step: %w", err)
 	}
-	return saved, nil
+	if existing != nil {
+		return existing, nil
+	}
+	return value, nil
 }
 
-func (e *Engine) loadStepValues(ctx context.Context, runID WorkflowID) (map[string]json.RawMessage, error) {
-	query := fmt.Sprintf(`
-SELECT step_key, value_json
-FROM %s
-WHERE run_id = $1;
-`, e.table("step_checkpoints"))
-	rows, err := e.db.Query(ctx, query, string(runID))
+func (e *Engine) parkForSleep(ctx context.Context, run claimedRun, next int, d time.Duration) error {
+	tag, err := e.db.Exec(ctx, e.sql.parkSleep, string(run.ID), run.Token, next, d.Milliseconds())
 	if err != nil {
-		return nil, fmt.Errorf("durablepg: load checkpoints: %w", err)
+		return fmt.Errorf("durablepg: park for sleep: %w", err)
 	}
-	defer rows.Close()
+	return fenced(tag.RowsAffected())
+}
 
-	values := make(map[string]json.RawMessage)
-	for rows.Next() {
-		var stepKey string
-		var raw []byte
-		if err := rows.Scan(&stepKey, &raw); err != nil {
-			return nil, fmt.Errorf("durablepg: scan checkpoint: %w", err)
+// waitForEvent delivers an already-emitted event, or parks the run on key.
+// It returns the stored outcome when delivered and nil when parked.
+func (e *Engine) waitForEvent(ctx context.Context, run claimedRun, index int, key string, timeout time.Duration, complete bool) (json.RawMessage, error) {
+	tx, err := e.beginEventTx(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("durablepg: begin wait tx: %w", err)
+	}
+	defer tx.Rollback(context.Background()) //nolint:errcheck
+	// Matches EmitEvent's lock. Whichever commits second sees the other: an
+	// event committed first is found below; a waiter committed first is woken
+	// by the emitter.
+	if _, err := tx.Exec(ctx, e.sql.lockEventKey, e.schema, key); err != nil {
+		return nil, fmt.Errorf("durablepg: lock event key: %w", err)
+	}
+	var payload []byte
+	err = tx.QueryRow(ctx, e.sql.latestEvent, key).Scan(&payload)
+	switch {
+	case err == nil:
+		received := make([]byte, 0, len(payload)+len(`{"received":}`))
+		received = append(append(append(received, `{"received":`...), payload...), '}')
+		stored, err := e.commitStep(ctx, tx, run, index, received, complete)
+		if err != nil {
+			return nil, err
 		}
-		name := stepName(stepKey)
-		cp := make([]byte, len(raw))
-		copy(cp, raw)
-		values[name] = cp
+		if err := tx.Commit(ctx); err != nil {
+			return nil, fmt.Errorf("durablepg: commit event delivery: %w", err)
+		}
+		return stored, nil
+	case !isNoRows(err):
+		return nil, fmt.Errorf("durablepg: look up event: %w", err)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("durablepg: iterate checkpoints: %w", err)
-	}
-	return values, nil
-}
-
-func (e *Engine) completeRun(ctx context.Context, run claimedRun, values map[string]json.RawMessage) error {
-	output, err := marshalOutput(values)
+	tag, err := tx.Exec(ctx, e.sql.parkWait, string(run.ID), run.Token, index, key, timeout.Milliseconds())
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("durablepg: park for event: %w", err)
 	}
-
-	query := fmt.Sprintf(`
-UPDATE %s
-SET state = 'completed',
-	output_json = $2::jsonb,
-	lease_owner = NULL,
-	lease_until = NULL,
-	waiting_event_key = NULL,
-	waiting_deadline = NULL,
-	last_error = NULL,
-	updated_at = now()
-WHERE id = $1
-  AND state = 'leased'
-  AND lease_owner = $3
-  AND lease_until > clock_timestamp();
-`, e.table("workflow_runs"))
-	tag, err := e.db.Exec(ctx, query, string(run.ID), output, run.LeaseOwner)
-	if err != nil {
-		return fmt.Errorf("durablepg: complete run: %w", err)
+	if err := fenced(tag.RowsAffected()); err != nil {
+		return nil, err
 	}
-	if tag.RowsAffected() == 0 {
-		return errLostLease
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("durablepg: commit wait: %w", err)
 	}
-	return nil
+	return nil, nil
 }
 
 func (e *Engine) failOrRetry(ctx context.Context, run claimedRun, cause error) error {
-	if errors.Is(cause, errLostLease) {
-		return nil
-	}
-
 	msg := cause.Error()
-	if len(msg) > 4000 {
-		msg = msg[:4000]
+	if len(msg) > maxErrorLength {
+		msg = msg[:maxErrorLength]
 	}
-
-	nextAttempt := run.Attempt + 1
-	if nextAttempt >= run.MaxAttempts {
-		query := fmt.Sprintf(`
-UPDATE %s
-SET state = 'failed',
-	attempt = $2,
-	last_error = $3,
-	lease_owner = NULL,
-	lease_until = NULL,
-	updated_at = now()
-WHERE id = $1
-  AND state = 'leased'
-  AND lease_owner = $4
-  AND lease_until > clock_timestamp();
-`, e.table("workflow_runs"))
-		_, err := e.db.Exec(ctx, query, string(run.ID), nextAttempt, msg, run.LeaseOwner)
-		if err != nil {
-			return fmt.Errorf("durablepg: mark failed: %w", err)
-		}
-		return nil
-	}
-
-	delay := backoffDuration(nextAttempt)
-	query := fmt.Sprintf(`
-UPDATE %s
-SET state = 'ready',
-	attempt = $2,
-	next_run_at = now() + ($3::bigint * INTERVAL '1 millisecond'),
-	last_error = $4,
-	lease_owner = NULL,
-	lease_until = NULL,
-	updated_at = now()
-WHERE id = $1
-  AND state = 'leased' 
-  AND lease_owner = $5
-  AND lease_until > clock_timestamp();
-`, e.table("workflow_runs"))
-	_, err := e.db.Exec(ctx, query, string(run.ID), nextAttempt, delay.Milliseconds(), msg, run.LeaseOwner)
+	attempt := run.Attempt + 1
+	tag, err := e.db.Exec(ctx, e.sql.failOrRetry, string(run.ID), run.Token, attempt, backoffDuration(attempt).Milliseconds(), msg)
 	if err != nil {
-		return fmt.Errorf("durablepg: schedule retry: %w", err)
+		return fmt.Errorf("durablepg: record failure: %w", err)
 	}
-	e.notifyWakeup(ctx, e.queue)
-	return nil
-}
-
-func (e *Engine) recoverExpiredLeases(ctx context.Context) error {
-	query := fmt.Sprintf(`
-WITH picked AS (
-	SELECT id
-	FROM %s
-	WHERE state = 'leased' AND lease_until < statement_timestamp()
-	ORDER BY lease_until, id
-	LIMIT 1024
-	FOR UPDATE SKIP LOCKED
-)
-UPDATE %s wr
-SET state = CASE WHEN wr.lease_failures + 1 >= wr.max_attempts OR wr.attempt >= wr.max_attempts
-                 THEN 'failed' ELSE 'ready' END,
-	lease_failures = wr.lease_failures + 1,
-	next_run_at = clock_timestamp() + (LEAST(60000, 250 * (1 << LEAST(wr.lease_failures, 8))) * INTERVAL '1 millisecond'),
-	lease_owner = NULL,
-	lease_until = NULL,
-	updated_at = now(),
-	last_error = 'lease expired'
-FROM picked
-WHERE wr.id = picked.id;
-`, e.table("workflow_runs"), e.table("workflow_runs"))
-	started := time.Now()
-	woke := false
-	defer func() {
-		if woke {
-			e.notifyWakeup(ctx, e.queue)
-		}
-	}()
-	for range 8 {
-		tag, err := e.db.Exec(ctx, query)
-		if err != nil {
-			return fmt.Errorf("durablepg: recover leases: %w", err)
-		}
-		woke = woke || tag.RowsAffected() > 0
-		if tag.RowsAffected() < 1024 || time.Since(started) >= time.Second {
-			break
-		}
+	if tag.RowsAffected() > 0 {
+		e.logger.Warn("workflow run attempt failed", "run_id", run.ID, "attempt", attempt, "error", msg)
 	}
 	return nil
 }
 
-func (e *Engine) promoteTimedOutWaiters(ctx context.Context) error {
-	query := fmt.Sprintf(`
-WITH picked AS (
-	SELECT id
-	FROM %s
-	WHERE state = 'waiting_event' AND waiting_deadline <= statement_timestamp()
-	ORDER BY waiting_deadline, id
-	LIMIT 1024
-	FOR UPDATE SKIP LOCKED
-), promoted AS (
-	UPDATE %s wr
-	SET state = 'ready',
-		next_run_at = now(),
-		waiting_event_key = NULL,
-		waiting_deadline = NULL,
-		updated_at = now(),
-		last_error = 'wait_event timeout'
-	FROM picked
-	WHERE wr.id = picked.id
-	RETURNING wr.id
-), removed AS (
-	DELETE FROM %s w USING promoted p WHERE w.run_id = p.id
-)
-SELECT count(*) FROM promoted;
-`, e.table("workflow_runs"), e.table("workflow_runs"), e.table("waiters"))
-	started := time.Now()
-	woke := false
-	defer func() {
-		if woke {
-			e.notifyWakeup(ctx, e.queue)
-		}
-	}()
-	for range 8 {
-		var count int
-		if err := e.db.QueryRow(ctx, query).Scan(&count); err != nil {
-			return fmt.Errorf("durablepg: promote waiters: %w", err)
-		}
-		woke = woke || count > 0
-		if count < 1024 || time.Since(started) >= time.Second {
-			break
-		}
-	}
-
-	// Remove orphaned expired registrations left by earlier, non-atomic wakes.
-	// Never delete a still-active registration, even when its deadline passed.
-	cleanup := fmt.Sprintf(`
-WITH expired AS (
-	SELECT w.event_key, w.run_id
-	FROM %s w
-	WHERE w.deadline <= statement_timestamp()
-	ORDER BY w.deadline, w.run_id
-	LIMIT 1024
-	FOR UPDATE OF w SKIP LOCKED
-)
-DELETE FROM %s w USING expired x
-WHERE w.event_key = x.event_key AND w.run_id = x.run_id
-  AND NOT EXISTS (
-	SELECT 1 FROM %s wr
-	WHERE wr.id = w.run_id AND wr.state = 'waiting_event'
-	  AND wr.waiting_event_key = w.event_key
-	  AND wr.waiting_deadline IS NOT DISTINCT FROM w.deadline
-  );
-`, e.table("waiters"), e.table("waiters"), e.table("workflow_runs"))
-	for range 8 {
-		tag, err := e.db.Exec(ctx, cleanup)
-		if err != nil {
-			return fmt.Errorf("durablepg: cleanup stale waiters: %w", err)
-		}
-		if tag.RowsAffected() < 1024 || time.Since(started) >= time.Second {
-			break
-		}
-	}
-	return nil
-}
-
-func (e *Engine) pruneExpiredEvents(ctx context.Context) error {
-	query := fmt.Sprintf(`
-WITH expired AS (
-	SELECT tableoid, ctid
-	FROM %s
-	WHERE expires_at <= statement_timestamp()
-	ORDER BY expires_at
-	LIMIT 2048
-	FOR UPDATE SKIP LOCKED
-)
-DELETE FROM %s ev USING expired
-WHERE ev.tableoid = expired.tableoid AND ev.ctid = expired.ctid;
-`, e.table("event_log"), e.table("event_log"))
-	// Keep each sweep bounded even if expired events are arriving faster than
-	// deletion; lease renewals share this pool.
-	started := time.Now()
-	for range 64 {
-		tag, err := e.db.Exec(ctx, query)
-		if err != nil {
-			return fmt.Errorf("durablepg: prune events: %w", err)
-		}
-		if tag.RowsAffected() < 2048 || time.Since(started) >= time.Second {
-			return nil
-		}
+func fenced(rowsAffected int64) error {
+	if rowsAffected == 0 {
+		return errLostLease
 	}
 	return nil
 }
@@ -991,40 +599,6 @@ func backoffDuration(attempt int) time.Duration {
 		delay = time.Minute
 	}
 	return delay
-}
-
-func formatStepKey(index int, step string) string {
-	return fmt.Sprintf("%04d:%s", index, step)
-}
-
-func stepName(stepKey string) string {
-	parts := strings.SplitN(stepKey, ":", 2)
-	if len(parts) != 2 {
-		return stepKey
-	}
-	return parts[1]
-}
-
-// Checkpoint result bytes are immutable after insertion into values. A fresh
-// map keeps retained StepContexts from seeing later steps; RawValue still
-// returns a defensive copy to callers.
-func cloneValues(in map[string]json.RawMessage) map[string]json.RawMessage {
-	out := make(map[string]json.RawMessage, len(in))
-	for k, v := range in {
-		out[k] = v
-	}
-	return out
-}
-
-func marshalOutput(values map[string]json.RawMessage) ([]byte, error) {
-	if len(values) == 0 {
-		return []byte(`{}`), nil
-	}
-	raw, err := json.Marshal(values)
-	if err != nil {
-		return nil, fmt.Errorf("durablepg: marshal output: %w", err)
-	}
-	return raw, nil
 }
 
 func isNoRows(err error) bool {
