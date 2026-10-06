@@ -883,3 +883,27 @@ func TestIntegrationHeartbeatRenewsAllClaimsInOneStatement(t *testing.T) {
 		t.Fatalf("largest renewal covered %d claims, want 4", largest.Load())
 	}
 }
+
+// A heartbeat at or past the lease TTL would let every lease expire between
+// renewals; refuse it rather than silently picking another interval.
+func TestNewRejectsHeartbeatNotShorterThanLease(t *testing.T) {
+	pool := &pgxpool.Pool{}
+	_, err := New(Config{DB: pool, LeaseTTL: 5 * time.Second, HeartbeatInterval: 5 * time.Second})
+	if err == nil || !strings.Contains(err.Error(), "HeartbeatInterval") {
+		t.Fatalf("New with heartbeat = lease: %v", err)
+	}
+	if _, err := New(Config{DB: pool, LeaseTTL: 5 * time.Second, HeartbeatInterval: time.Second}); err != nil {
+		t.Fatalf("valid config rejected: %v", err)
+	}
+}
+
+// An explicit zero attempt limit is a caller mistake, not a request for the default.
+func TestIntegrationRunRejectsNonPositiveMaxAttempts(t *testing.T) {
+	e, _ := integrationEngine(t)
+	e.RegisterWorkflow("limited", func(b *Builder) {
+		b.Step("done", func(context.Context, *StepContext) (any, error) { return true, nil })
+	})
+	if _, err := e.Run(context.Background(), "limited", nil, WithMaxAttempts(0)); err == nil {
+		t.Fatal("WithMaxAttempts(0) was accepted")
+	}
+}

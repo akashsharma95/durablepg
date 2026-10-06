@@ -108,11 +108,9 @@ func New(cfg Config) (*Engine, error) {
 	if heartbeat <= 0 {
 		heartbeat = defaultHeartbeatInterval
 	}
+	// A renewal must land before the lease it renews expires.
 	if heartbeat >= leaseTTL {
-		heartbeat = leaseTTL / 2
-		if heartbeat <= 0 {
-			heartbeat = time.Second
-		}
+		return nil, fmt.Errorf("durablepg: HeartbeatInterval %v must be shorter than LeaseTTL %v", heartbeat, leaseTTL)
 	}
 
 	logger := cfg.Logger
@@ -232,7 +230,7 @@ func (e *Engine) Enqueue(ctx context.Context, name string, input any, opts ...En
 		return "", errors.New("durablepg: queue cannot be empty")
 	}
 	if o.maxAttempts <= 0 {
-		o.maxAttempts = defaultMaxAttempts
+		return "", fmt.Errorf("durablepg: max attempts must be positive, got %d", o.maxAttempts)
 	}
 	if o.runID == "" {
 		o.runID = WorkflowID(newUUID())
