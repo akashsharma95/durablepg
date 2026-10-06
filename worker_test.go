@@ -2,7 +2,9 @@ package durablepg
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestResolveWaitKeyUsesCurrentRunAndCompletedValues(t *testing.T) {
@@ -42,5 +44,18 @@ func TestResolveWaitKeyUsesCurrentRunAndCompletedValues(t *testing.T) {
 		if !json.Valid(values[0]) {
 			t.Fatalf("resolver mutated completed values for %s", tc.run.ID)
 		}
+	}
+}
+
+// A truncated error must stay valid UTF-8: PostgreSQL rejects invalid text,
+// and the failure (attempt count and message) would be lost.
+func TestTruncateErrorKeepsValidUTF8(t *testing.T) {
+	msg := strings.Repeat("a", maxErrorLength-1) + "é" + "tail"
+	got := truncateError(msg)
+	if !utf8.ValidString(got) || len(got) != maxErrorLength-1 {
+		t.Fatalf("truncateError: valid=%v len=%d", utf8.ValidString(got), len(got))
+	}
+	if short := "short"; truncateError(short) != short {
+		t.Fatal("short message changed")
 	}
 }

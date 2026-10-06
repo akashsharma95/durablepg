@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"golang.org/x/sync/errgroup"
@@ -276,7 +277,9 @@ func (e *Engine) dispatchLoop(ctx, workCtx context.Context, cancelWork context.C
 		if available <= 0 {
 			return
 		}
-		runs, err := e.claimReadyRuns(ctx, available)
+		// Not ctx: canceling mid-statement can drop rows the server already
+		// leased, leaving them to expire as lease failures without running.
+		runs, err := e.claimReadyRuns(workCtx, available)
 		if err != nil {
 			if ctx.Err() == nil {
 				e.logger.Error("claim ready workflow runs", "error", err)
@@ -564,10 +567,7 @@ func (e *Engine) waitForEvent(ctx context.Context, run claimedRun, index int, ke
 }
 
 func (e *Engine) failOrRetry(ctx context.Context, run claimedRun, cause error) error {
-	msg := cause.Error()
-	if len(msg) > maxErrorLength {
-		msg = msg[:maxErrorLength]
-	}
+	msg := truncateError(cause.Error())
 	attempt := run.Attempt + 1
 	tag, err := e.db.Exec(ctx, e.sql.failOrRetry, string(run.ID), run.Token, attempt, backoffDuration(attempt).Milliseconds(), msg)
 	if err != nil {
@@ -577,6 +577,19 @@ func (e *Engine) failOrRetry(ctx context.Context, run claimedRun, cause error) e
 		e.logger.Warn("workflow run attempt failed", "run_id", run.ID, "attempt", attempt, "error", msg)
 	}
 	return nil
+}
+
+// truncateError bounds a stored error without splitting a UTF-8 sequence,
+// which PostgreSQL would reject, losing the failure record.
+func truncateError(msg string) string {
+	if len(msg) <= maxErrorLength {
+		return msg
+	}
+	end := maxErrorLength
+	for end > 0 && !utf8.RuneStart(msg[end]) {
+		end--
+	}
+	return msg[:end]
 }
 
 func fenced(rowsAffected int64) error {
