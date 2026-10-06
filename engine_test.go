@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -771,5 +773,113 @@ func TestIntegrationNotificationsAreScopedToSchema(t *testing.T) {
 	defer cancelShort()
 	if stray, err := foreign.Conn().WaitForNotification(short); err == nil {
 		t.Fatalf("other schema was notified: %+v", stray)
+	}
+}
+
+type panickingResult struct{}
+
+func (panickingResult) MarshalJSON() ([]byte, error) { panic("cannot encode") }
+
+// A result whose encoding panics is a step failure, not a worker crash, and
+// an error that PostgreSQL text cannot hold (NUL, invalid UTF-8) must still
+// be recorded rather than lost to lease expiry.
+func TestIntegrationUnstorableResultsAndErrorsAreRecordedFailures(t *testing.T) {
+	e, _ := integrationEngine(t)
+	e.RegisterWorkflow("bad_result", func(b *Builder) {
+		b.Step("encode", func(context.Context, *StepContext) (any, error) { return panickingResult{}, nil })
+	})
+	e.RegisterWorkflow("bad_error", func(b *Builder) {
+		b.Step("fail", func(context.Context, *StepContext) (any, error) { return nil, errors.New("bad\x00byte\xff") })
+	})
+	stop := startTestWorker(t, e)
+	defer stop()
+	for _, tc := range []struct{ workflow, wantError string }{
+		{"bad_result", "cannot encode"},
+		{"bad_error", "bad�byte�"},
+	} {
+		runID, err := e.Run(context.Background(), tc.workflow, nil, WithMaxAttempts(1))
+		if err != nil {
+			t.Fatal(err)
+		}
+		waitRunState(t, e, runID, "failed")
+		st, err := e.RunStatus(context.Background(), runID)
+		if err != nil || st.Attempt != 1 || st.LeaseFailures != 0 || st.LastError == nil || !strings.Contains(*st.LastError, tc.wantError) {
+			t.Fatalf("%s: status %+v, %v", tc.workflow, st, err)
+		}
+	}
+}
+
+// Workers match queue names exactly, so a padded name must be normalized and
+// an empty one refused rather than enqueued where no worker claims it.
+func TestIntegrationQueueNamesAreTrimmed(t *testing.T) {
+	producer, pool := integrationEngine(t)
+	worker, err := New(Config{DB: pool, Schema: producer.schema, Queue: "q", PollInterval: 10 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	build := func(b *Builder) {
+		b.Step("done", func(context.Context, *StepContext) (any, error) { return true, nil })
+	}
+	producer.RegisterWorkflow("queued", build)
+	worker.RegisterWorkflow("queued", build)
+	stop := startTestWorker(t, worker)
+	defer stop()
+	runID, err := producer.Run(context.Background(), "queued", nil, WithQueue(" q "))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitRunState(t, producer, runID, "completed")
+	if _, err := producer.Run(context.Background(), "queued", nil, WithQueue("  ")); err == nil {
+		t.Fatal("empty queue was accepted")
+	}
+}
+
+// One heartbeat statement renews every claim a worker holds; per-claim
+// renewals would cost C statements per interval and saturate small pools.
+func TestIntegrationHeartbeatRenewsAllClaimsInOneStatement(t *testing.T) {
+	producer, _ := integrationEngine(t)
+	var renewals, largest atomic.Int64
+	worker, pool := architectureWorkerWith(t, producer, func(cfg *pgxpool.Config) {
+		cfg.ConnConfig.Tracer = architectureQueryTrace{start: func(ctx context.Context, data pgx.TraceQueryStartData) context.Context {
+			if strings.Contains(data.SQL, "unnest($1::uuid[], $2::uuid[])") {
+				renewals.Add(1)
+				if ids, ok := data.Args[0].([]string); ok && int64(len(ids)) > largest.Load() {
+					largest.Store(int64(len(ids)))
+				}
+			}
+			return ctx
+		}}
+	})
+	defer pool.Close()
+	worker.maxConcurrency = 4
+	started := make(chan struct{}, 4)
+	release := make(chan struct{})
+	build := func(b *Builder) {
+		b.Step("hold", func(context.Context, *StepContext) (any, error) {
+			started <- struct{}{}
+			<-release
+			return true, nil
+		})
+	}
+	producer.RegisterWorkflow("held", build)
+	worker.RegisterWorkflow("held", build)
+	stop := startTestWorker(t, worker)
+	defer stop()
+	defer close(release)
+	for range 4 {
+		if _, err := producer.Run(context.Background(), "held", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for range 4 {
+		architectureSignal(t, started, "claim start")
+	}
+	renewals.Store(0)
+	time.Sleep(550 * time.Millisecond) // About five 100 ms heartbeats.
+	if n := renewals.Load(); n < 3 || n > 7 {
+		t.Fatalf("renewal statements in ~5 heartbeats with 4 claims = %d, want about 5", n)
+	}
+	if largest.Load() != 4 {
+		t.Fatalf("largest renewal covered %d claims, want 4", largest.Load())
 	}
 }

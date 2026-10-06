@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -485,15 +486,7 @@ func runStep(ctx context.Context, sc *StepContext, step *stepOp) (json.RawMessag
 		execCtx, cancel = context.WithTimeout(ctx, step.opts.timeout)
 		defer cancel()
 	}
-	out, err := executeStepSafely(execCtx, step.name, step.fn, sc)
-	if err != nil {
-		return nil, err
-	}
-	raw, err := json.Marshal(out)
-	if err != nil {
-		return nil, fmt.Errorf("durablepg: marshal step %q output: %w", step.name, err)
-	}
-	return raw, nil
+	return executeStepSafely(execCtx, step.name, step.fn, sc)
 }
 
 // commitStep saves the result at index and advances the cursor; with
@@ -567,7 +560,7 @@ func (e *Engine) waitForEvent(ctx context.Context, run claimedRun, index int, ke
 }
 
 func (e *Engine) failOrRetry(ctx context.Context, run claimedRun, cause error) error {
-	msg := truncateError(cause.Error())
+	msg := sanitizeError(cause.Error())
 	attempt := run.Attempt + 1
 	tag, err := e.db.Exec(ctx, e.sql.failOrRetry, string(run.ID), run.Token, attempt, backoffDuration(attempt).Milliseconds(), msg)
 	if err != nil {
@@ -579,9 +572,11 @@ func (e *Engine) failOrRetry(ctx context.Context, run claimedRun, cause error) e
 	return nil
 }
 
-// truncateError bounds a stored error without splitting a UTF-8 sequence,
-// which PostgreSQL would reject, losing the failure record.
-func truncateError(msg string) string {
+// sanitizeError makes an error storable as PostgreSQL text, which rejects NUL
+// bytes and invalid UTF-8; storing either would lose the failure record. It
+// also bounds the length without splitting a UTF-8 sequence.
+func sanitizeError(msg string) string {
+	msg = strings.ReplaceAll(strings.ToValidUTF8(msg, "\uFFFD"), "\x00", "\uFFFD")
 	if len(msg) <= maxErrorLength {
 		return msg
 	}
@@ -618,11 +613,21 @@ func isNoRows(err error) bool {
 	return errors.Is(err, pgx.ErrNoRows)
 }
 
-func executeStepSafely(ctx context.Context, name string, fn StepFunc, sc *StepContext) (_ any, err error) {
+// executeStepSafely runs a step and encodes its result. Encoding is inside the
+// recover because a result's MarshalJSON can panic too.
+func executeStepSafely(ctx context.Context, name string, fn StepFunc, sc *StepContext) (_ json.RawMessage, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("durablepg: step %q panicked: %v\n%s", name, r, string(debug.Stack()))
 		}
 	}()
-	return fn(ctx, sc)
+	out, err := fn(ctx, sc)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := json.Marshal(out)
+	if err != nil {
+		return nil, fmt.Errorf("durablepg: marshal step %q output: %w", name, err)
+	}
+	return raw, nil
 }

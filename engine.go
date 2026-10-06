@@ -226,8 +226,10 @@ func (e *Engine) Enqueue(ctx context.Context, name string, input any, opts ...En
 		return "", fmt.Errorf("durablepg: workflow %q version %d is not registered", name, o.workflowVersion)
 	}
 
-	if strings.TrimSpace(o.queue) == "" {
-		o.queue = e.queue
+	// Workers match queues exactly; an untrimmed name would never be claimed.
+	o.queue = strings.TrimSpace(o.queue)
+	if o.queue == "" {
+		return "", errors.New("durablepg: queue cannot be empty")
 	}
 	if o.maxAttempts <= 0 {
 		o.maxAttempts = defaultMaxAttempts

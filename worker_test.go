@@ -47,15 +47,18 @@ func TestResolveWaitKeyUsesCurrentRunAndCompletedValues(t *testing.T) {
 	}
 }
 
-// A truncated error must stay valid UTF-8: PostgreSQL rejects invalid text,
-// and the failure (attempt count and message) would be lost.
-func TestTruncateErrorKeepsValidUTF8(t *testing.T) {
+// A stored error must be valid PostgreSQL text: no NUL, valid UTF-8, even
+// when truncated. Otherwise the failure (attempt count and message) is lost.
+func TestSanitizeErrorProducesStorableText(t *testing.T) {
 	msg := strings.Repeat("a", maxErrorLength-1) + "é" + "tail"
-	got := truncateError(msg)
+	got := sanitizeError(msg)
 	if !utf8.ValidString(got) || len(got) != maxErrorLength-1 {
-		t.Fatalf("truncateError: valid=%v len=%d", utf8.ValidString(got), len(got))
+		t.Fatalf("sanitizeError: valid=%v len=%d", utf8.ValidString(got), len(got))
 	}
-	if short := "short"; truncateError(short) != short {
+	if got := sanitizeError("bad\x00byte\xff"); got != "bad\uFFFDbyte\uFFFD" {
+		t.Fatalf("sanitizeError(NUL, invalid) = %q", got)
+	}
+	if short := "short"; sanitizeError(short) != short {
 		t.Fatal("short message changed")
 	}
 }
