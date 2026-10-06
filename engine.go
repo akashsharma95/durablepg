@@ -26,8 +26,7 @@ const (
 	defaultHeartbeatInterval = 10 * time.Second
 	defaultMaxAttempts       = 25
 	defaultEventTTL          = 24 * time.Hour
-	// Leaves room for the "durablepg_" channel prefix within PostgreSQL's
-	// 63-byte identifier limit.
+	// Leaves room for the "durablepg_" channel prefix in a 63-byte identifier.
 	maxSchemaLength = 48
 )
 
@@ -45,7 +44,6 @@ type Engine struct {
 	schema  string
 	qSchema string
 	queue   string
-	// channel carries NOTIFY wakeups for this schema; the payload is a queue.
 	channel string
 	sql     queries
 
@@ -60,7 +58,7 @@ type Engine struct {
 	workflows map[workflowKey]*compiledWorkflow
 	logger    *slog.Logger
 
-	// Claims can outlive StartWorker's bounded drain if user steps ignore context.
+	// Claims can outlive StartWorker's bounded drain.
 	activeClaims sync.WaitGroup
 
 	workerMu      sync.Mutex
@@ -108,7 +106,6 @@ func New(cfg Config) (*Engine, error) {
 	if heartbeat <= 0 {
 		heartbeat = defaultHeartbeatInterval
 	}
-	// A renewal must land before the lease it renews expires.
 	if heartbeat >= leaseTTL {
 		return nil, fmt.Errorf("durablepg: HeartbeatInterval %v must be shorter than LeaseTTL %v", heartbeat, leaseTTL)
 	}
@@ -224,7 +221,6 @@ func (e *Engine) Enqueue(ctx context.Context, name string, input any, opts ...En
 		return "", fmt.Errorf("durablepg: workflow %q version %d is not registered", name, o.workflowVersion)
 	}
 
-	// Workers match queues exactly; an untrimmed name would never be claimed.
 	o.queue = strings.TrimSpace(o.queue)
 	if o.queue == "" {
 		return "", errors.New("durablepg: queue cannot be empty")
@@ -259,8 +255,7 @@ func (e *Engine) RunWorkflow(ctx context.Context, name string, input any, opts .
 	return e.Run(ctx, name, input, opts...)
 }
 
-// EmitEvent records an event and wakes runs waiting on key, returning how
-// many woke. Events stay available to later waits for 24 hours.
+// EmitEvent records an event, wakes runs waiting on key, and returns how many woke.
 func (e *Engine) EmitEvent(ctx context.Context, key string, payload any) (int, error) {
 	key = strings.TrimSpace(key)
 	if key == "" {
@@ -277,9 +272,7 @@ func (e *Engine) EmitEvent(ctx context.Context, key string, payload any) (int, e
 		return 0, fmt.Errorf("durablepg: begin emit tx: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
-	// Serializes with waiter registration for this key. The wake statement
-	// below starts after the lock, so its snapshot sees any waiter that
-	// committed first; a waiter that registers later sees this event.
+	// Pairs with the waiter's lock: whichever commits second sees the other.
 	if _, err := tx.Exec(ctx, e.sql.lockEventKey, e.schema, key); err != nil {
 		return 0, fmt.Errorf("durablepg: lock event key: %w", err)
 	}
@@ -293,9 +286,7 @@ func (e *Engine) EmitEvent(ctx context.Context, key string, payload any) (int, e
 	return int(woken), nil
 }
 
-// beginEventTx starts a transaction for the event-key protocol. Each statement
-// after the key lock must see rows committed before it, which READ COMMITTED
-// guarantees and a REPEATABLE READ server default would not.
+// Each statement after the event-key lock needs a fresh snapshot, so pin READ COMMITTED.
 func (e *Engine) beginEventTx(ctx context.Context) (pgx.Tx, error) {
 	return e.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 }
@@ -317,8 +308,7 @@ func (e *Engine) RunStatus(ctx context.Context, id WorkflowID) (RunStatus, error
 	return st, nil
 }
 
-// RunOutput decodes a completed run's output, the result of its last step or
-// wait, into dst. It reports false until the run has completed.
+// RunOutput decodes a completed run's last result into dst; false until completed.
 func (e *Engine) RunOutput(ctx context.Context, id WorkflowID, dst any) (bool, error) {
 	var state string
 	var output []byte
@@ -341,8 +331,7 @@ func (e *Engine) RunOutput(ctx context.Context, id WorkflowID, dst any) (bool, e
 	return true, nil
 }
 
-// Cancel moves an unfinished run to cancelled. A worker executing it loses its
-// lease, and its step context is canceled at the next lease renewal.
+// Cancel cancels an unfinished run; its step context is canceled at the next lease renewal.
 func (e *Engine) Cancel(ctx context.Context, id WorkflowID) (CancelOutcome, error) {
 	tag, err := e.db.Exec(ctx, e.sql.cancelRun, string(id))
 	if err != nil {
@@ -351,8 +340,7 @@ func (e *Engine) Cancel(ctx context.Context, id WorkflowID) (CancelOutcome, erro
 	if tag.RowsAffected() > 0 {
 		return CancelOutcome{Cancelled: true, State: RunCancelled}, nil
 	}
-	// A separate statement: if the UPDATE waited on a worker that just
-	// finished the run, its own snapshot still shows the old state.
+	// Re-read: the UPDATE's snapshot can predate a concurrent completion.
 	var state string
 	err = e.db.QueryRow(ctx, e.sql.runState, string(id)).Scan(&state)
 	if isNoRows(err) {
@@ -388,9 +376,7 @@ func (e *Engine) endWorker() {
 	e.workerMu.Unlock()
 }
 
-// WaitForIdle waits for claims that outlived StartWorker's bounded shutdown.
-// Call it after StartWorker returns and before closing the database pool.
-// A step that ignores cancellation can keep this method waiting indefinitely.
+// WaitForIdle waits for claims that outlived StartWorker's drain; call it before closing the pool.
 func (e *Engine) WaitForIdle(ctx context.Context) error {
 	e.workerMu.Lock()
 	defer e.workerMu.Unlock() // Prevent a new worker from adding claims during Wait.
@@ -410,8 +396,7 @@ func (e *Engine) WaitForIdle(ctx context.Context) error {
 	}
 }
 
-// newUUID returns a time-ordered UUIDv7, which keeps primary-key inserts
-// clustered at the end of the index.
+// newUUID returns a time-ordered UUIDv7.
 func newUUID() string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {

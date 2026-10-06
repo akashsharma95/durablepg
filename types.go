@@ -55,8 +55,7 @@ type RunStatus struct {
 	UpdatedAt       time.Time
 }
 
-// CancelOutcome reports what Cancel did. When Cancelled is false, State is
-// the terminal state the run had already reached.
+// CancelOutcome reports whether Cancel cancelled the run, or its existing terminal State.
 type CancelOutcome struct {
 	Cancelled bool
 	State     RunState
@@ -78,8 +77,6 @@ type StepContext struct {
 	Input    json.RawMessage
 	StepKey  string
 
-	// values holds checkpointed results by operation index; names maps
-	// operation names to indexes for the definition being executed.
 	values []json.RawMessage
 	names  map[string]int
 }
@@ -133,8 +130,7 @@ func (sc *StepContext) StepResult(step string, dst any) error {
 	return nil
 }
 
-// Event decodes the outcome of a prior wait. It reports false when the wait
-// timed out, and decodes the event payload into dst when it was received.
+// Event decodes a prior wait's payload into dst; false when the wait timed out.
 func (sc *StepContext) Event(wait string, dst any) (bool, error) {
 	if sc == nil {
 		return false, errors.New("nil step context")
@@ -191,8 +187,7 @@ func (sc *StepContext) RawValue(step string) (json.RawMessage, bool) {
 	return cp, true
 }
 
-// IdempotencyKey identifies this run and step across retries and lease recovery.
-// Pass it to external systems that support idempotent operations.
+// IdempotencyKey is stable across retries for this run and step.
 func (sc *StepContext) IdempotencyKey() string {
 	if sc == nil || sc.RunID == "" || sc.StepKey == "" {
 		return ""

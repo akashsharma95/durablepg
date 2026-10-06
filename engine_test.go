@@ -21,7 +21,6 @@ func TestNewRequiresDB(t *testing.T) {
 	}
 }
 
-// Run IDs are UUIDv7 so primary-key inserts stay clustered by time.
 func TestNewUUIDFormat(t *testing.T) {
 	id := newUUID()
 	if len(id) != 36 {
@@ -53,7 +52,6 @@ func TestBeginWorkerGuardsDoubleStart(t *testing.T) {
 	}
 }
 
-// integrationEngine uses a disposable schema in an explicitly configured test database.
 func integrationEngine(t *testing.T) (*Engine, *pgxpool.Pool) {
 	t.Helper()
 	url := os.Getenv("DURABLEPG_TEST_DATABASE_URL")
@@ -328,8 +326,6 @@ func TestIntegrationOldLeaseCannotCheckpoint(t *testing.T) {
 	}
 }
 
-// Every process calls ApplySchema on start, so repeated and concurrent calls
-// must converge on one recorded migration.
 func TestIntegrationApplySchemaIsIdempotentAndConcurrentSafe(t *testing.T) {
 	e, pool := integrationEngine(t)
 	ctx := context.Background()
@@ -359,7 +355,6 @@ func TestIntegrationApplySchemaIsIdempotentAndConcurrentSafe(t *testing.T) {
 	}
 }
 
-// A schema migrated by a newer library must be refused, not misused.
 func TestIntegrationNewerSchemaVersionIsRejected(t *testing.T) {
 	e, pool := integrationEngine(t)
 	if _, err := pool.Exec(context.Background(), fmt.Sprintf("INSERT INTO %s (version) VALUES (2)", e.table("schema_migrations"))); err != nil {
@@ -415,8 +410,6 @@ func TestIntegrationVersionedRunsRequireCompatibleWorkers(t *testing.T) {
 	waitRunState(t, producer, newRun, "completed")
 }
 
-// An event for one key must not wake a run waiting on another key, even one
-// it previously waited on.
 func TestIntegrationEventForPreviousKeyDoesNotWakeNextWait(t *testing.T) {
 	e, _ := integrationEngine(t)
 	e.RegisterWorkflow("two_waits", func(b *Builder) {
@@ -536,8 +529,6 @@ func TestIntegrationPruneExpiredEventsPreservesLiveEvents(t *testing.T) {
 	}
 }
 
-// A wait that times out records that outcome, so the next step can tell a
-// timeout from a delivery.
 func TestIntegrationTimedOutWaitRecordsTimedOut(t *testing.T) {
 	e, pool := integrationEngine(t)
 	e.RegisterWorkflow("timeout", func(b *Builder) {
@@ -653,8 +644,6 @@ func TestIntegrationWaitForIdleIncludesUncooperativeStep(t *testing.T) {
 	}
 }
 
-// Cancelling a running run must cancel its step context promptly and fence
-// its writes; cancelling again reports the terminal state.
 func TestIntegrationCancelStopsRunningStep(t *testing.T) {
 	e, _ := integrationEngine(t)
 	started := make(chan struct{})
@@ -694,7 +683,6 @@ func TestIntegrationCancelStopsRunningStep(t *testing.T) {
 	}
 }
 
-// Cancelling a waiting run removes it from event delivery.
 func TestIntegrationCancelledWaitingRunIsNotWoken(t *testing.T) {
 	e, _ := integrationEngine(t)
 	e.RegisterWorkflow("wait_cancel", func(b *Builder) {
@@ -715,8 +703,6 @@ func TestIntegrationCancelledWaitingRunIsNotWoken(t *testing.T) {
 	}
 }
 
-// Notifications drive dispatch: with polling effectively disabled, a new run
-// still starts promptly through the listener's dedicated connection.
 func TestIntegrationNotificationWakesIdleWorker(t *testing.T) {
 	producer, pool := integrationEngine(t)
 	worker, err := New(Config{DB: pool, Schema: producer.schema, PollInterval: time.Hour})
@@ -730,7 +716,6 @@ func TestIntegrationNotificationWakesIdleWorker(t *testing.T) {
 	worker.RegisterWorkflow("notified", build)
 	stop := startTestWorker(t, worker)
 	defer stop()
-	// Let the first poll and listener setup pass.
 	time.Sleep(300 * time.Millisecond)
 	runID, err := producer.Run(context.Background(), "notified", nil)
 	if err != nil {
@@ -739,8 +724,6 @@ func TestIntegrationNotificationWakesIdleWorker(t *testing.T) {
 	waitRunState(t, producer, runID, "completed")
 }
 
-// The notify channel is per schema, so engines on different schemas in one
-// database do not wake each other.
 func TestIntegrationNotificationsAreScopedToSchema(t *testing.T) {
 	e, pool := integrationEngine(t)
 	e.RegisterWorkflow("scoped", func(b *Builder) {
@@ -780,9 +763,6 @@ type panickingResult struct{}
 
 func (panickingResult) MarshalJSON() ([]byte, error) { panic("cannot encode") }
 
-// A result whose encoding panics is a step failure, not a worker crash, and
-// an error that PostgreSQL text cannot hold (NUL, invalid UTF-8) must still
-// be recorded rather than lost to lease expiry.
 func TestIntegrationUnstorableResultsAndErrorsAreRecordedFailures(t *testing.T) {
 	e, _ := integrationEngine(t)
 	e.RegisterWorkflow("bad_result", func(b *Builder) {
@@ -809,8 +789,6 @@ func TestIntegrationUnstorableResultsAndErrorsAreRecordedFailures(t *testing.T) 
 	}
 }
 
-// Workers match queue names exactly, so a padded name must be normalized and
-// an empty one refused rather than enqueued where no worker claims it.
 func TestIntegrationQueueNamesAreTrimmed(t *testing.T) {
 	producer, pool := integrationEngine(t)
 	worker, err := New(Config{DB: pool, Schema: producer.schema, Queue: "q", PollInterval: 10 * time.Millisecond})
@@ -834,8 +812,6 @@ func TestIntegrationQueueNamesAreTrimmed(t *testing.T) {
 	}
 }
 
-// One heartbeat statement renews every claim a worker holds; per-claim
-// renewals would cost C statements per interval and saturate small pools.
 func TestIntegrationHeartbeatRenewsAllClaimsInOneStatement(t *testing.T) {
 	producer, _ := integrationEngine(t)
 	var renewals, largest atomic.Int64
@@ -884,8 +860,6 @@ func TestIntegrationHeartbeatRenewsAllClaimsInOneStatement(t *testing.T) {
 	}
 }
 
-// A heartbeat at or past the lease TTL would let every lease expire between
-// renewals; refuse it rather than silently picking another interval.
 func TestNewRejectsHeartbeatNotShorterThanLease(t *testing.T) {
 	pool := &pgxpool.Pool{}
 	_, err := New(Config{DB: pool, LeaseTTL: 5 * time.Second, HeartbeatInterval: 5 * time.Second})
@@ -897,7 +871,6 @@ func TestNewRejectsHeartbeatNotShorterThanLease(t *testing.T) {
 	}
 }
 
-// An explicit zero attempt limit is a caller mistake, not a request for the default.
 func TestIntegrationRunRejectsNonPositiveMaxAttempts(t *testing.T) {
 	e, _ := integrationEngine(t)
 	e.RegisterWorkflow("limited", func(b *Builder) {

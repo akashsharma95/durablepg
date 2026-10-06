@@ -14,8 +14,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// architectureQueryTrace gates a completed database operation, not a timer:
-// the producer can commit precisely after the worker's first event miss.
 type architectureQueryTrace struct {
 	start func(context.Context, pgx.TraceQueryStartData) context.Context
 	end   func(context.Context, pgx.TraceQueryEndData)
@@ -83,9 +81,6 @@ func architectureStopWorker(t *testing.T, cancel context.CancelFunc, done <-chan
 	}
 }
 
-// The waiter-registration race: an event committed while the worker is
-// blocked on the key lock must be seen by the worker's lookup, so the run is
-// not parked until its timeout.
 func TestIntegrationEventCommittedWhileWaiterBlocksOnLockIsDelivered(t *testing.T) {
 	producer, _ := integrationEngine(t)
 	worker, pool := architectureWorkerWith(t, producer, func(*pgxpool.Config) {})
@@ -93,10 +88,6 @@ func TestIntegrationEventCommittedWhileWaiterBlocksOnLockIsDelivered(t *testing.
 	eventCommittedDuringLockWaitIsDelivered(t, producer, worker)
 }
 
-// The race protocol needs each statement's snapshot to start after the key
-// lock. Under a REPEATABLE READ default the snapshot is taken by the lock
-// statement itself, before the lock is granted, so the engine must pin READ
-// COMMITTED or the run parks after the event and is never woken.
 func TestIntegrationWaitRaceHoldsUnderRepeatableReadDefault(t *testing.T) {
 	producer, _ := integrationEngine(t)
 	worker, pool := architectureWorkerWith(t, producer, func(cfg *pgxpool.Config) {
@@ -113,8 +104,6 @@ func eventCommittedDuringLockWaitIsDelivered(t *testing.T, producer, worker *Eng
 	producer.RegisterWorkflow("race", build)
 	worker.RegisterWorkflow("race", build)
 
-	// Hold the key lock and write an event in an open transaction, as a
-	// concurrent emitter would.
 	emitter, err := producer.db.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -144,8 +133,7 @@ func eventCommittedDuringLockWaitIsDelivered(t *testing.T, producer, worker *Eng
 	}
 
 	waitRunState(t, producer, runID, "completed")
-	// A retry could also deliver the event, but the protocol must not need one:
-	// a parked run would only be found again at its timeout.
+	// A retry would also deliver it; the protocol must not need one.
 	st, err := producer.RunStatus(ctx, runID)
 	if err != nil || st.Attempt != 0 {
 		t.Fatalf("delivered after a failed attempt: %+v, %v", st, err)
@@ -158,9 +146,6 @@ func eventCommittedDuringLockWaitIsDelivered(t *testing.T, producer, worker *Eng
 	}
 }
 
-// A checkpoint left at the current cursor by an older or interrupted worker
-// is authoritative. Recovery must expose that value to later steps and must
-// never repeat the checkpointed callback.
 func TestIntegrationCheckpointAtCursorRecoversCanonicalOutput(t *testing.T) {
 	e, pool := integrationEngine(t)
 	var called atomic.Int32
@@ -197,9 +182,6 @@ func TestIntegrationCheckpointAtCursorRecoversCanonicalOutput(t *testing.T) {
 	}
 }
 
-// Pause after the database has committed the first checkpoint but before the
-// old owner proceeds. Replacing the lease must fence that owner, and recovery
-// of the committed step must use its canonical result without reexecution.
 func TestIntegrationAtomicCheckpointCommitFencesStaleOwner(t *testing.T) {
 	producer, pool := integrationEngine(t)
 	var called atomic.Int32
@@ -222,7 +204,7 @@ func TestIntegrationAtomicCheckpointCommitFencesStaleOwner(t *testing.T) {
 	type commitMark struct{}
 	trace := architectureQueryTrace{
 		start: func(ctx context.Context, data pgx.TraceQueryStartData) context.Context {
-			// The step commit; maintenance also inserts checkpoints for timeouts.
+			// Only the step commit; maintenance also inserts checkpoints.
 			if strings.Contains(data.SQL, "owned AS MATERIALIZED") && firstCommit.CompareAndSwap(false, true) {
 				return context.WithValue(ctx, commitMark{}, true)
 			}

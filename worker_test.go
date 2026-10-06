@@ -47,8 +47,6 @@ func TestResolveWaitKeyUsesCurrentRunAndCompletedValues(t *testing.T) {
 	}
 }
 
-// A stored error must be valid PostgreSQL text: no NUL, valid UTF-8, even
-// when truncated. Otherwise the failure (attempt count and message) is lost.
 func TestSanitizeErrorProducesStorableText(t *testing.T) {
 	msg := strings.Repeat("a", maxErrorLength-1) + "é" + "tail"
 	got := sanitizeError(msg)

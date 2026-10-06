@@ -324,8 +324,7 @@ func run() error {
 				producerDone <- nil
 				return
 			case <-ticker.C:
-				// Do not cancel an in-flight INSERT at shutdown: it could commit
-				// without being counted, making the final drain ambiguous.
+				// A canceled INSERT could commit uncounted.
 				if _, err := short.Run(ctx, "short", nil); err != nil {
 					producerDone <- err
 					return

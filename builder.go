@@ -62,7 +62,6 @@ type Builder struct {
 	stepNames map[string]struct{}
 }
 
-// addName registers a step or wait name; results are looked up by name.
 func (b *Builder) addName(name string) string {
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -115,8 +114,7 @@ func (b *Builder) Sleep(d time.Duration) {
 	b.ops = append(b.ops, operation{kind: opSleep, sleep: d})
 }
 
-// WaitEvent pauses execution until key is emitted or timeout is reached.
-// Later steps read the outcome with StepContext.Event(name, &payload).
+// WaitEvent pauses until key is emitted or timeout elapses; read the outcome with StepContext.Event.
 func (b *Builder) WaitEvent(name, key string, timeout time.Duration) {
 	if b == nil {
 		panic("durablepg: nil builder")
@@ -134,8 +132,7 @@ func (b *Builder) WaitEvent(name, key string, timeout time.Duration) {
 	})
 }
 
-// WaitEventFunc resolves a run-specific event key from its input and prior steps.
-// The resolver may be called again after a retry; it must be deterministic.
+// WaitEventFunc is WaitEvent with a key derived from the run; keyFn must be deterministic.
 func (b *Builder) WaitEventFunc(name string, keyFn func(*StepContext) (string, error), timeout time.Duration) {
 	if b == nil {
 		panic("durablepg: nil builder")
@@ -153,12 +150,10 @@ func (b *Builder) WaitEventFunc(name string, keyFn func(*StepContext) (string, e
 }
 
 type compiledWorkflow struct {
-	name    string
-	version int
-	ops     []operation
-	// names maps step and wait names to operation indexes.
-	names map[string]int
-	// outputIndex is the last value-producing operation, or -1 if none.
+	name        string
+	version     int
+	ops         []operation
+	names       map[string]int
 	outputIndex int
 }
 
@@ -183,8 +178,7 @@ func DefineWorkflow(name string, build func(*Builder)) Workflow {
 	return DefineWorkflowVersion(name, 1, build)
 }
 
-// DefineWorkflowVersion creates a workflow definition with an immutable version.
-// Keep earlier versions registered while their runs are still active.
+// DefineWorkflowVersion creates an immutable workflow version.
 func DefineWorkflowVersion(name string, version int, build func(*Builder)) Workflow {
 	return workflowDefinition{name: name, version: version, build: build}
 }

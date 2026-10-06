@@ -28,20 +28,15 @@ type claimedRun struct {
 	Input        json.RawMessage
 	Attempt      int
 	Token        string
-	// checkpoints maps operation indexes to stored results.
-	checkpoints map[int]json.RawMessage
-	deadline    time.Time
+	checkpoints  map[int]json.RawMessage
+	deadline     time.Time
 }
 
-// querier is satisfied by both the pool and a transaction.
 type querier interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
-// StartWorker polls and claims runs until ctx is canceled, then drains active
-// claims for at least five seconds and at most max(leaseTTL, five seconds).
-// After that, their contexts are canceled; Go cannot forcibly stop a step
-// that ignores its context, but claim fencing prevents its later DB writes.
+// StartWorker runs claims until ctx is canceled, then drains for up to max(LeaseTTL, 5s).
 func (e *Engine) StartWorker(ctx context.Context) error {
 	if err := e.beginWorker(); err != nil {
 		return err
@@ -55,8 +50,7 @@ func (e *Engine) StartWorker(ctx context.Context) error {
 	}
 
 	g, dispatchCtx := errgroup.WithContext(ctx)
-	// Claimed work and the heartbeat outlive the dispatcher's cancellation while
-	// shutdown drains. A bounded drain handles steps that ignore cancellation.
+	// Claims and the heartbeat outlive dispatch while shutdown drains.
 	workCtx, cancelWork := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelWork()
 	leases := newLeaseTable()
@@ -68,9 +62,6 @@ func (e *Engine) StartWorker(ctx context.Context) error {
 	return g.Wait()
 }
 
-// listenLoop wakes dispatch on notifications for this worker's queue. It
-// holds its own connection outside the pool, so even a one-connection pool
-// keeps notifications. Notifications are hints; polling is the recovery path.
 func (e *Engine) listenLoop(ctx context.Context, wake chan<- struct{}) error {
 	signal := func() {
 		select {
@@ -101,7 +92,6 @@ func (e *Engine) listen(ctx context.Context, signal func()) error {
 	if _, err := conn.Exec(ctx, "LISTEN "+quoteIdentifier(e.channel)); err != nil {
 		return fmt.Errorf("listen: %w", err)
 	}
-	// Work may have arrived while disconnected.
 	signal()
 	for {
 		note, err := conn.WaitForNotification(ctx)
@@ -115,11 +105,9 @@ func (e *Engine) listen(ctx context.Context, signal func()) error {
 	}
 }
 
-// maintenanceLoop recovers leases and times out waits independently of event retention.
 func (e *Engine) maintenanceLoop(ctx context.Context) error {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-	// Retention has its own loop so a large prune cannot defer recovery.
 	maintain := func() {
 		if err := e.recoverExpiredLeases(ctx); err != nil && ctx.Err() == nil {
 			e.logger.Error("recover expired workflow leases", "error", err)
@@ -161,8 +149,6 @@ func (e *Engine) recoverExpiredLeases(ctx context.Context) error {
 	})
 }
 
-// promoteTimedOutWaiters records a timed-out outcome for expired waits and
-// makes their runs ready.
 func (e *Engine) promoteTimedOutWaiters(ctx context.Context) error {
 	return batches(time.Now(), 8, maintenanceBatch, func() (int64, error) {
 		var promoted, notified int64
@@ -171,8 +157,6 @@ func (e *Engine) promoteTimedOutWaiters(ctx context.Context) error {
 	})
 }
 
-// pruneExpiredEvents keeps each sweep bounded even if expired events arrive
-// faster than deletion; lease renewals share this pool.
 func (e *Engine) pruneExpiredEvents(ctx context.Context) error {
 	return batches(time.Now(), 64, pruneBatch, func() (int64, error) {
 		tag, err := e.db.Exec(ctx, e.sql.pruneEvents)
@@ -180,8 +164,6 @@ func (e *Engine) pruneExpiredEvents(ctx context.Context) error {
 	})
 }
 
-// batches repeats batch while it processes full batches, within a count and
-// a one-second budget, so a backlog cannot starve the pool.
 func batches(started time.Time, maxBatches int, size int64, batch func() (int64, error)) error {
 	for range maxBatches {
 		n, err := batch()
@@ -195,8 +177,6 @@ func batches(started time.Time, maxBatches int, size int64, batch func() (int64,
 	return nil
 }
 
-// heartbeatLoop renews all of this worker's leases every heartbeat interval
-// and cancels any claim whose last confirmed deadline passes without renewal.
 func (e *Engine) heartbeatLoop(ctx context.Context, leases *leaseTable) error {
 	nextRenewal := time.Now().Add(e.heartbeatEvery)
 	timer := time.NewTimer(e.heartbeatEvery)
@@ -217,7 +197,7 @@ func (e *Engine) heartbeatLoop(ctx context.Context, leases *leaseTable) error {
 			continue
 		}
 		nextRenewal = now.Add(e.heartbeatEvery)
-		// Recomputed here: claims taken during the sleep are not in wakeAt.
+		// Recomputed: claims taken during the sleep are not in wakeAt.
 		earliest, ok := leases.expire(now)
 		runIDs, tokens := leases.snapshot()
 		if len(tokens) == 0 {
@@ -235,7 +215,6 @@ func (e *Engine) heartbeatLoop(ctx context.Context, leases *leaseTable) error {
 			if ctx.Err() != nil {
 				return nil
 			}
-			// Transient failures are tolerated until each lease's deadline.
 			e.logger.Warn("renew workflow leases", "error", err)
 			continue
 		}
@@ -261,8 +240,6 @@ func (e *Engine) renewLeases(ctx context.Context, runIDs, tokens []string) (map[
 }
 
 func (e *Engine) dispatchLoop(ctx, workCtx context.Context, cancelWork context.CancelFunc, leases *leaseTable, wake chan struct{}) error {
-	// The heartbeat stops once dispatch returns: claims have either drained or
-	// been abandoned.
 	defer cancelWork()
 	var wg sync.WaitGroup
 	var inFlight atomic.Int64
@@ -278,8 +255,7 @@ func (e *Engine) dispatchLoop(ctx, workCtx context.Context, cancelWork context.C
 		if available <= 0 {
 			return
 		}
-		// Not ctx: canceling mid-statement can drop rows the server already
-		// leased, leaving them to expire as lease failures without running.
+		// Not ctx: canceling mid-statement can drop rows already leased.
 		runs, err := e.claimReadyRuns(workCtx, available)
 		if err != nil {
 			if ctx.Err() == nil {
@@ -324,8 +300,6 @@ func (e *Engine) dispatchLoop(ctx, workCtx context.Context, cancelWork context.C
 			select {
 			case <-done:
 			case <-timer.C:
-				// Noncooperative user code cannot be killed. Cancel the heartbeat
-				// and fence all writes; the run is recovered when the lease expires.
 			}
 			return nil
 		case <-ticker.C:
@@ -344,8 +318,7 @@ func (e *Engine) claimReadyRuns(ctx context.Context, limit int) ([]claimedRun, e
 	if len(names) == 0 {
 		return nil, nil
 	}
-	// A single supported definition is common in isolated queues. Equality
-	// predicates let PostgreSQL use workflow_runs_selective_ready_idx directly.
+	// Equality predicates use the selective ready index.
 	query := e.sql.claimMulti
 	var nameArg, versionArg any = names, versions
 	if len(names) == 1 {
@@ -360,7 +333,6 @@ func (e *Engine) claimReadyRuns(ctx context.Context, limit int) ([]claimedRun, e
 	}
 	defer rows.Close()
 
-	// The database set lease_until after started, so this is conservative.
 	deadline := started.Add(e.leaseTTL)
 	runs := make([]claimedRun, 0, limit)
 	for rows.Next() {
@@ -393,8 +365,6 @@ func (e *Engine) claimReadyRuns(ctx context.Context, limit int) ([]claimedRun, e
 	return runs, nil
 }
 
-// executeClaim drives a run and records a failure. Lost leases, cancellation,
-// and abandoned claims write nothing; it returns only failures to record one.
 func (e *Engine) executeClaim(ctx context.Context, run claimedRun) error {
 	err := e.drive(ctx, run)
 	if err == nil || errors.Is(err, errLostLease) || ctx.Err() != nil {
@@ -406,7 +376,6 @@ func (e *Engine) executeClaim(ctx context.Context, run claimedRun) error {
 func (e *Engine) drive(ctx context.Context, run claimedRun) error {
 	wf, ok := e.workflow(run.WorkflowName, run.Version)
 	if !ok || wf == nil {
-		// Claims filter on registered definitions; leave it for lease recovery.
 		return errLostLease
 	}
 	values := make([]json.RawMessage, len(wf.ops))
@@ -420,8 +389,7 @@ func (e *Engine) drive(ctx context.Context, run claimedRun) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		// A checkpoint at the cursor was committed by an earlier claim (or an
-		// event delivery) whose cursor update this claim has not seen yet.
+		// Written by an earlier claim or event delivery.
 		if values[index] != nil {
 			continue
 		}
@@ -466,8 +434,7 @@ func (e *Engine) drive(ctx context.Context, run claimedRun) error {
 	return fenced(tag.RowsAffected())
 }
 
-// stepContext snapshots completed values so a retained context cannot see
-// later results.
+// stepContext copies values so a retained context cannot see later results.
 func (e *Engine) stepContext(run claimedRun, wf *compiledWorkflow, values []json.RawMessage, index int, name string) *StepContext {
 	return &StepContext{
 		RunID:    run.ID,
@@ -489,9 +456,7 @@ func runStep(ctx context.Context, sc *StepContext, step *stepOp) (json.RawMessag
 	return executeStepSafely(execCtx, step.name, step.fn, sc)
 }
 
-// commitStep saves the result at index and advances the cursor; with
-// complete, it also finishes the run. It returns the stored value, which is an
-// earlier claim's checkpoint if one already exists at this position.
+// commitStep returns the stored value: an existing checkpoint at index wins.
 func (e *Engine) commitStep(ctx context.Context, q querier, run claimedRun, index int, value []byte, complete bool) (json.RawMessage, error) {
 	var existing []byte
 	err := q.QueryRow(ctx, e.sql.commitStep, string(run.ID), run.Token, index, value, complete).Scan(&existing)
@@ -515,17 +480,14 @@ func (e *Engine) parkForSleep(ctx context.Context, run claimedRun, next int, d t
 	return fenced(tag.RowsAffected())
 }
 
-// waitForEvent delivers an already-emitted event, or parks the run on key.
-// It returns the stored outcome when delivered and nil when parked.
+// waitForEvent returns the stored outcome when delivered, nil when parked.
 func (e *Engine) waitForEvent(ctx context.Context, run claimedRun, index int, key string, timeout time.Duration, complete bool) (json.RawMessage, error) {
 	tx, err := e.beginEventTx(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("durablepg: begin wait tx: %w", err)
 	}
 	defer tx.Rollback(context.Background()) //nolint:errcheck
-	// Matches EmitEvent's lock. Whichever commits second sees the other: an
-	// event committed first is found below; a waiter committed first is woken
-	// by the emitter.
+	// Pairs with EmitEvent's lock: whichever commits second sees the other.
 	if _, err := tx.Exec(ctx, e.sql.lockEventKey, e.schema, key); err != nil {
 		return nil, fmt.Errorf("durablepg: lock event key: %w", err)
 	}
@@ -572,9 +534,7 @@ func (e *Engine) failOrRetry(ctx context.Context, run claimedRun, cause error) e
 	return nil
 }
 
-// sanitizeError makes an error storable as PostgreSQL text, which rejects NUL
-// bytes and invalid UTF-8; storing either would lose the failure record. It
-// also bounds the length without splitting a UTF-8 sequence.
+// sanitizeError makes msg storable as PostgreSQL text: no NUL, valid UTF-8, bounded.
 func sanitizeError(msg string) string {
 	msg = strings.ReplaceAll(strings.ToValidUTF8(msg, "\uFFFD"), "\x00", "\uFFFD")
 	if len(msg) <= maxErrorLength {
@@ -613,8 +573,7 @@ func isNoRows(err error) bool {
 	return errors.Is(err, pgx.ErrNoRows)
 }
 
-// executeStepSafely runs a step and encodes its result. Encoding is inside the
-// recover because a result's MarshalJSON can panic too.
+// MarshalJSON can panic too, so encoding happens inside the recover.
 func executeStepSafely(ctx context.Context, name string, fn StepFunc, sc *StepContext) (_ json.RawMessage, err error) {
 	defer func() {
 		if r := recover(); r != nil {

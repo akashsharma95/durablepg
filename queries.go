@@ -2,20 +2,15 @@ package durablepg
 
 import "fmt"
 
-// Every statement that changes a leased run is fenced by
-// state = 'leased' AND lease_token = $token AND lease_until > clock_timestamp(),
-// so a worker whose lease expired or was replaced cannot write progress.
+// Every write to a claimed run requires its current, unexpired lease.
 const fence = "id = $1 AND state = 'leased' AND lease_token = $2 AND lease_until > clock_timestamp()"
 
 const (
-	// Rows handled by one maintenance statement.
 	maintenanceBatch = 1024
-	// Rows deleted by one event-retention statement.
-	pruneBatch = 2048
+	pruneBatch       = 2048
 )
 
-// queries holds every statement, rendered once per engine for its schema.
-// Schema names are validated identifiers and every value is a bind parameter.
+// queries holds every statement, rendered once per schema.
 type queries struct {
 	lockEventKey    string
 	insertRun       string
@@ -65,8 +60,7 @@ RETURNING wr.id::text, wr.workflow_name, wr.workflow_version, wr.step_index, wr.
 	}
 	return queries{
 		lockEventKey: "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
-		// ON CONFLICT DO UPDATE, unlike DO NOTHING, returns the existing row
-		// even when it committed after this statement's snapshot.
+		// DO UPDATE, unlike DO NOTHING, returns a conflicting row committed after the snapshot.
 		insertRun: fmt.Sprintf(`
 WITH ins AS (
 	INSERT INTO %[1]s (id, workflow_name, workflow_version, queue, state, max_attempts,
@@ -79,8 +73,6 @@ WITH ins AS (
 	SELECT pg_notify($9, queue) FROM ins WHERE inserted AND next_run_at <= now()
 )
 SELECT id::text, (SELECT count(*) FROM notified) FROM ins`, runs),
-		// Runs after the per-key advisory lock, in a statement whose snapshot
-		// includes any waiter registered before the lock.
 		emitEvent: fmt.Sprintf(`
 WITH event AS (
 	INSERT INTO %[3]s (event_key, payload_json, expires_at)
@@ -108,9 +100,7 @@ FROM unnest($1::uuid[], $2::uuid[]) AS claim(id, token)
 WHERE wr.id = claim.id AND wr.lease_token = claim.token
   AND wr.state = 'leased' AND wr.lease_until > clock_timestamp()
 RETURNING wr.lease_token::text`, runs),
-		// Records the first result at this position and advances the cursor
-		// atomically. A checkpoint left by an earlier claim wins and is
-		// returned. With $5, the same statement completes the run.
+		// An existing checkpoint wins and is returned; with $5 the run also completes.
 		commitStep: fmt.Sprintf(`
 WITH owned AS MATERIALIZED (
 	SELECT id FROM %[1]s WHERE %[3]s AND step_index <= $3 FOR UPDATE
@@ -152,8 +142,7 @@ SELECT payload_json FROM %[1]s
 WHERE event_key = $1 AND expires_at > now()
 ORDER BY created_at DESC, id DESC
 LIMIT 1`, events),
-		// The cursor stays on the wait; delivery or timeout records its
-		// outcome as the checkpoint at that position.
+		// The cursor stays on the wait; delivery or timeout checkpoints it there.
 		parkWait: fmt.Sprintf(`
 UPDATE %[1]s
 SET state = 'waiting_event', step_index = $3, waiting_event_key = $4,

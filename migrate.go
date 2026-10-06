@@ -10,9 +10,7 @@ import (
 // ErrUnsupportedSchema reports a schema migrated by a newer library version.
 var ErrUnsupportedSchema = errors.New("durablepg: unsupported schema version")
 
-// ApplySchema creates or upgrades the schema through ordered, transactional
-// migrations. It is safe to call on every start and from concurrent processes.
-// A schema migrated by a newer library version is refused.
+// ApplySchema creates or upgrades the schema; safe to call concurrently and on every start.
 func (e *Engine) ApplySchema(ctx context.Context) error {
 	tx, err := e.db.Begin(ctx)
 	if err != nil {
@@ -61,8 +59,7 @@ func (e *Engine) Migrate(ctx context.Context) error {
 	return e.ApplySchema(ctx)
 }
 
-// SchemaSQL returns the complete fresh-install DDL, including all migrations.
-// ApplySchema separately records each migration in schema_migrations.
+// SchemaSQL returns the fresh-install DDL.
 func (e *Engine) SchemaSQL() string {
 	return "CREATE SCHEMA IF NOT EXISTS " + e.qSchema + ";\n" + strings.Join(e.migrations(), "")
 }

@@ -23,12 +23,6 @@ import (
 const benchmarkDatabaseURLEnv = "DURABLEPG_TEST_DATABASE_URL"
 const benchmarkSchemaName = "durable"
 
-// These benchmarks use a real PostgreSQL instance because the meaningful
-// performance questions for this library are end-to-end:
-// 1. producer throughput for inserting new workflow runs,
-// 2. fully durable completion throughput through claim/checkpoint/complete, and
-// 3. wake-up latency for event-driven workflows.
-
 func BenchmarkEnqueue(b *testing.B) {
 	h := newBenchmarkHarness(b, "enqueue", runtime.GOMAXPROCS(0))
 	h.engine.RegisterWorkflow("enqueue_bench", func(wf *Builder) {
@@ -127,10 +121,7 @@ func BenchmarkE2ESingleStep(b *testing.B) {
 	}
 }
 
-// These two completion benchmarks include enqueue, worker execution, and the
-// final completion poll in workflows/s. enqueue-runs/s excludes the drain wait;
-// allocations include both the producer and workers. Results depend on the
-// PostgreSQL host, pool contention, and polling cadence, not just step code.
+// workflows/s includes enqueue and drain; enqueue-runs/s excludes the drain.
 func BenchmarkE2ETenSteps(b *testing.B) {
 	h := newBenchmarkHarness(b, "e2e_ten_steps", max(1, runtime.GOMAXPROCS(0)))
 	h.engine.RegisterWorkflow("ten_steps_bench", func(wf *Builder) {
