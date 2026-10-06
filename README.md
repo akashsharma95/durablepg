@@ -47,7 +47,7 @@ func main() {
     if err != nil {
         panic(err)
     }
-    if err := engine.Init(ctx); err != nil {
+    if err := engine.ApplySchema(ctx); err != nil {
         panic(err)
     }
 
@@ -88,7 +88,7 @@ func main() {
 }
 ```
 
-`Init` applies schema migrations and creates event-log partitions for the current month and the next 12. Call it before enqueueing or starting a worker. `StartWorker` blocks until its context is canceled; run it in a goroutine if the process must also serve requests.
+`ApplySchema` creates or upgrades the schema; it is safe to call on every start. Call it before enqueueing or starting a worker. `StartWorker` blocks until its context is canceled; run it in a goroutine if the process must also serve requests.
 
 ## Define a workflow
 
@@ -98,12 +98,12 @@ func main() {
 | --- | --- |
 | `Step(name, fn)` | Calls `fn` unless its result was checkpointed; saves the JSON result for later steps. Step names must be unique. |
 | `Sleep(duration)` | Stores the next position and a due time; no worker stays occupied during the sleep. |
-| `WaitEvent(key, timeout)` | Waits on a fixed event key. |
-| `WaitEventFunc(resolve, timeout)` | Derives an exact key for this run from its input or prior results. The resolver must return the same key on retry. |
+| `WaitEvent(name, key, timeout)` | Waits on a fixed event key and records the outcome under `name`. |
+| `WaitEventFunc(name, resolve, timeout)` | Derives an exact key for this run from its input or prior results. The resolver must return the same key on retry. |
 
-A step receives its input through `sc.DecodeInput`, earlier results through `sc.StepResult` or `sc.Value`, and a cancellation-aware `context.Context`. `WithStepTimeout` cancels that context after a deadline; it cannot forcibly stop code that ignores cancellation. Outputs must be JSON-serializable.
+Step and wait names must be unique within a definition. A step receives its input through `sc.DecodeInput`, earlier results through `sc.StepResult` or `sc.Value`, and a cancellation-aware `context.Context`. `WithStepTimeout` cancels that context after a deadline; it cannot forcibly stop code that ignores cancellation. Outputs must be JSON-serializable.
 
-Use `sc.IdempotencyKey()` when an external API accepts an idempotency token. It combines the run ID and step key and remains stable across retries and lease recovery:
+Use `sc.IdempotencyKey()` when an external API accepts an idempotency token. It combines the run ID, the step's position, and its name, and remains stable across retries and lease recovery:
 
 ```go
 b.Step("charge", func(ctx context.Context, sc *durablepg.StepContext) (any, error) {
@@ -113,29 +113,43 @@ b.Step("charge", func(ctx context.Context, sc *durablepg.StepContext) (any, erro
 
 This fragment assumes your application's `payments` client and `amount`. The engine does not coordinate a transaction with that client. For effects in your own database, a transactional outbox is another option.
 
-### Events are signals, not step results
+### Events
 
-For an order-specific wait, resolve the key from the run rather than capturing one order ID when registering the definition:
+For an order-specific wait, resolve the key from the run rather than capturing one order ID when registering the definition, and read the outcome in a later step:
 
 ```go
-b.WaitEventFunc(func(sc *durablepg.StepContext) (string, error) {
+b.WaitEventFunc("payment", func(sc *durablepg.StepContext) (string, error) {
     var in orderInput
     if err := sc.DecodeInput(&in); err != nil {
         return "", err
     }
     return "order.paid:" + in.OrderID, nil
 }, 30*time.Minute)
+b.Step("finish", func(_ context.Context, sc *durablepg.StepContext) (any, error) {
+    var cents int
+    paid, err := sc.Event("payment", &cents)
+    if err != nil || !paid {
+        return "expired", err
+    }
+    return cents, nil
+})
 ```
 
-The payment handler can call `engine.EmitEvent(ctx, "order.paid:ord-42", payload)`. Emission stores the event and wakes runs waiting on that exact key. Events remain available for 24 hours: a matching event emitted *before* a run reaches the wait can also satisfy it. Keys shared by multiple runs can wake all of them. The payload is stored in `event_log` but is **not** passed to the next step.
-
-A timeout also advances to the next operation. If that operation requires payment, confirmation, or another real-world condition, check its source of truth there; reaching the next step does not prove an event arrived.
+The payment handler calls `engine.EmitEvent(ctx, "order.paid:ord-42", 1999)`, which stores the event, wakes runs waiting on that exact key, and returns how many woke. Each woken run records the payload as the wait's result; a wait that times out records that instead, so `Event` reports `false`. Events remain available for 24 hours: an event emitted *before* a run reaches the wait also satisfies it, with the most recent payload. Keys shared by multiple runs wake all of them.
 
 ## Enqueueing and deployments
 
-`Run(ctx, name, input, options...)` inserts a `ready` run and returns its ID. `Enqueue` is equivalent. Useful options include `WithScheduledAt`, `WithQueue`, `WithMaxAttempts`, `WithWorkflowVersion`, and `WithDeduplicationKey`.
+`Run(ctx, name, input, options...)` inserts a `ready` run and returns its ID. `Enqueue` is equivalent. Useful options include `WithScheduledAt`, `WithQueue`, `WithMaxAttempts`, `WithWorkflowVersion`, `WithDeduplicationKey`, and `WithRunID`.
 
-Without an explicit ID, `Run` generates one locally before inserting; it does not query PostgreSQL to generate an ID. `EmitEvent` and waiter registration serialize by schema and event key so an event published during registration is not lost if the worker stops before its post-commit recheck. Use `EmitEvent` rather than inserting event rows directly for reliable wakeups.
+Without an explicit ID, `Run` generates a time-ordered UUIDv7 locally; an ID passed to `WithRunID` must be a UUID. `EmitEvent` and waiter registration serialize by schema and event key, so an event published while a run registers its wait is never missed. Use `EmitEvent` rather than inserting event rows directly.
+
+| Method | Purpose |
+| --- | --- |
+| `RunStatus(ctx, id)` | State, cursor, attempts, lease failures, wait key and deadline, last error. |
+| `RunOutput(ctx, id, &dst)` | Decodes the completed run's output: the result of its last step or wait. Reports `false` until the run completes. |
+| `Cancel(ctx, id)` | Moves an unfinished run to `cancelled`. A worker executing it loses its lease, and the step's context is canceled at the next renewal. |
+
+Both `RunStatus` and `Cancel` return `ErrRunNotFound` for an unknown ID.
 
 Without an explicit version, `Run` chooses the highest version registered **on that engine**. A worker claims only `(name, version)` pairs it has registered:
 
@@ -152,51 +166,43 @@ Treat a published definition as immutable. Deploy version 2 while keeping versio
 
 - Completed step results are checkpointed. A crash before a checkpoint can repeat the step; a crash after it replays the saved result. PostgreSQL lease fencing prevents an expired worker from writing new workflow progress, **not** from making an external call it already started.
 - A returned step error schedules another attempt with exponential backoff from 250 ms to 60 s. The default maximum is 25 failed attempts per run. Consecutive expired leases have separate failure accounting and backoff; progress resets that counter.
-- Workers poll for due runs (250 ms by default). `LISTEN/NOTIFY` can wake them sooner, but notifications are hints, not durable work. With a one-connection pool, the listener is disabled and polling still works.
+- Workers poll for due runs (250 ms by default). `LISTEN/NOTIFY` on a per-schema channel wakes them sooner, but notifications are hints, not durable work. The listener opens its own connection outside the pool, so even a one-connection pool keeps notifications.
 - Canceling `StartWorker` stops new claims and allows active work to drain for up to `max(LeaseTTL, 5s)`. It then cancels remaining work. Go cannot kill a step that ignores its context. Call `WaitForIdle` **after** `StartWorker` returns and before closing the pool if all step goroutines must have exited; an uncooperative step can make that wait indefinite.
 
-`Config` requires a `*pgxpool.Pool`. The default schema and queue are `durable` and `default`; `MaxConcurrency` defaults to `runtime.GOMAXPROCS(0)`, `LeaseTTL` to 30 s, and `HeartbeatInterval` to 10 s. `PollInterval`, `Schema`, `Queue`, and a `*slog.Logger` are configurable. Worker database errors go to that logger (`slog.Default()` if unset). Size the pool for concurrent steps, heartbeats, maintenance, and the listener; watch pool acquisition time before raising concurrency.
+`Config` requires a `*pgxpool.Pool`. The default schema and queue are `durable` and `default`; `MaxConcurrency` defaults to `runtime.GOMAXPROCS(0)`, `LeaseTTL` to 30 s, and `HeartbeatInterval` to 10 s. `PollInterval`, `Schema`, `Queue`, and a `*slog.Logger` are configurable. Worker database errors go to that logger (`slog.Default()` if unset). Each worker renews all of its leases in one statement per heartbeat. Size the pool for concurrent steps, the heartbeat, and maintenance; the listener's connection is extra. Watch pool acquisition time before raising concurrency.
 
 ## Operating the database
 
-The principal tables are `workflow_runs` (state, input, due time, version, lease), `step_checkpoints` (saved step values), `waiters` (event registrations), `event_log` (partitioned event history), and `schema_migrations`. See [Architecture](ARCHITECTURE.md#storage-and-migrations) for ownership and indexes.
+The tables are `workflow_runs` (state, input, output, due time, version, lease, wait key), `step_checkpoints` (saved results by position), `event_log` (event history), and `schema_migrations`. See [Architecture](ARCHITECTURE.md#storage-and-migrations) for ownership and indexes. This schema is not compatible with releases before the Rust-parity rewrite; there is no in-place migration, so drain old runs and use a fresh schema.
 
-`Init` is safe to repeat. Existing event partitions avoid an exclusive table lock, but creating a missing month can take one while moving matching rows out of the default partition. Pre-create future ranges. Workers delete expired events in bounded batches; they do **not** automatically drop old partitions, which can contain events with no expiration. Plan retention around your event volume and monitor overdue `ready` runs, `waiting_event` deadlines, failed runs, and pool pressure.
+Workers delete expired events in bounded batches. Monitor overdue `ready` runs, `waiting_event` deadlines, failed runs, and pool pressure.
 
-Completed/failed runs and checkpoints have no automatic TTL. Deleting a run also forgets its deduplication key; set a retention policy that accounts for late producer retries before purging history. Before retiring a workflow version, drain or keep a compatible worker for its nonterminal runs. After restoring a database backup, reconcile external effects performed after the backup and ensure their idempotency keys remain valid before restarting workers. See [operational limits](ARCHITECTURE.md#operational-signals-and-limits) for pool, backlog, recovery, and retention guidance.
+Completed, failed, and cancelled runs and checkpoints have no automatic TTL. Deleting a run also forgets its deduplication key; set a retention policy that accounts for late producer retries before purging history. Before retiring a workflow version, drain or keep a compatible worker for its nonterminal runs. After restoring a database backup, reconcile external effects performed after the backup and ensure their idempotency keys remain valid before restarting workers. See [operational limits](ARCHITECTURE.md#operational-signals-and-limits) for pool, backlog, recovery, and retention guidance.
 
 ## Benchmarks
 
-The repository's benchmarks use a real PostgreSQL instance and isolated databases via `pgtestdb`. A paired local run on an Apple M5 Max, PostgreSQL 17 in Podman, `GOMAXPROCS=4`, and `-benchtime=100x -count=1` produced:
+The repository's benchmarks use a real PostgreSQL instance and isolated databases via `pgtestdb`. The table compares the previous design, the current one, and the [Rust port](https://github.com/akashsharma95/durable-workflow-rs) it was aligned with. All three ran in alternation on one host (Apple M5 Max, PostgreSQL 18 in Podman), three rounds each, with the same settings: 1,000 runs per workload into a fresh schema from four producers, poll 10 ms, lease 5 s, heartbeat 1 s, a pool of `max(4, CPUs)`, four slots unless noted, `GOMAXPROCS=4` and a four-thread Tokio runtime. Rust used fixed-count probes that mirror these Go benchmarks rather than its Criterion suite.
 
-| Benchmark | Before architecture changes | After |
-| --- | ---: | ---: |
-| Enqueue | 2,735 runs/s | 3,047 runs/s |
-| One-step completion, one slot | 101.8 workflows/s | 704.0 workflows/s |
-| One-step completion, four slots | 409.3 workflows/s | 1,116 workflows/s |
-| Event wake-to-completion | 6,709 µs | 7,229 µs |
+| Workload | Previous Go | Current Go | Rust |
+| --- | ---: | ---: | ---: |
+| Enqueue | 8,934–9,063 runs/s | 8,742–8,834 runs/s | 8,127–9,214 runs/s |
+| One-step completion, one slot | 1,321–1,324 workflows/s | 2,058–2,105 workflows/s | 2,048–2,077 workflows/s |
+| One-step completion, four slots | 2,604–2,625 workflows/s | 4,053–4,120 workflows/s | 4,215–4,269 workflows/s |
+| Ten steps | 879–881 workflows/s | 996–999 workflows/s | 1,020–1,031 workflows/s |
+| Ten 64 KiB results | 110 workflows/s | 238–239 workflows/s | 241–244 workflows/s |
+| Event wake to completion, back-to-back state queries (200 wakes) | 1.80–1.88 ms | 1.16–1.17 ms | 1.21–1.22 ms |
+| `EmitEvent` alone | 0.85–0.91 ms | 0.54–0.56 ms | 0.59–0.60 ms |
 
-The wake path was slower in that historical sample. Single-pass local numbers are comparisons, not a capacity promise.
+The gains come from fewer statements, not the driver: a one-step run now takes two statements (claim with checkpoints, commit that also completes) instead of four, the output is the last result rather than a map of every result, and `EmitEvent` is one statement after the key lock. Upgrading pgx from 5.7.6 to 5.11.0 changed no workload by more than run-to-run noise. Enqueue did not improve: the previous design, an insert followed by a separate `pg_notify` statement, was 1–3% faster than the current single statement. With the same design, Go and Rust are within 4% of each other on every workload. Single-host samples are comparisons, not capacity guarantees.
 
-The following comparison uses isolated PostgreSQL 18.6 Podman databases on the same host with `GOMAXPROCS=4` and `-benchtime=1000x`. The earlier implementation was run three times; the current implementation twice:
-
-| Workload | Earlier range | Current range |
-| --- | ---: | ---: |
-| Enqueue | 3,338–3,487 runs/s | 6,381–6,747 runs/s |
-| One-step completion, one slot | 815–867 workflows/s | 1,085–1,089 workflows/s |
-| One-step completion, four slots | 1,512–1,540 workflows/s | 2,056–2,135 workflows/s |
-| Event wake-to-completion | 7,159–7,202 µs | 7,278–7,323 µs |
-
-Event wake latency did **not** improve in this sample. Two additional current-only workloads at `-benchtime=100x -count=2` measured 677–681 workflows/s for ten short steps and 88.9–92.9 workflows/s for ten 64 KiB step results (four slots).
-
-The ten-step benchmarks include enqueue and drain to completion; their `enqueue-runs/s` metric excludes the drain, while `workflows/s` includes it. Each benchmark uses a fresh disposable database. Short samples, local database latency, and a 5 ms event-state polling interval limit interpretation; repeat against representative payloads, database latency, concurrency, and retention before setting production capacity limits.
-
-To repeat the current workload matrix, provide a disposable PostgreSQL database as `DURABLEPG_TEST_DATABASE_URL`:
+To repeat the Go side, provide a disposable PostgreSQL database as `DURABLEPG_TEST_DATABASE_URL`:
 
 ```bash
-GOMAXPROCS=4 DURABLEPG_TEST_DATABASE_URL='postgres://postgres:localtest@127.0.0.1:55432/durablepg?sslmode=disable' \
-go test -run '^$' -bench 'Benchmark(Enqueue|E2ESingleStep|E2ETenSteps|E2ETenLargeStepResults|E2EEventWakeLatency)$' -benchtime=100x -count=2
+GOMAXPROCS=4 DURABLEPG_TEST_DATABASE_URL='postgres://postgres:localtest@127.0.0.1:55433/durablepg?sslmode=disable' \
+go test -run '^$' -bench . -benchtime=1000x
 ```
+
+`BenchmarkE2EEventWakeLatency` polls run state every 5 ms, which dominates its result (about 7 ms for both designs); the event rows above use back-to-back state queries instead.
 
 The integration tests also use `DURABLEPG_TEST_DATABASE_URL`; without it, they skip PostgreSQL-specific cases.
 
@@ -210,7 +216,7 @@ go run ./cmd/growthbench -profile=default -stage=45s -rate=100 -active=64 -histo
 
 The workload holds 64 long claims at the default 10-second heartbeat, enqueues 100 real short workflows per second, and adds terminal runs plus checkpoints at each history milestone. `tuned` tests per-table `autovacuum_vacuum_scale_factor=0.005`, `autovacuum_vacuum_threshold=200`, and `vacuum_index_cleanup=on`; it is an experimental comparison, **not** a production setting. Output includes productive claim-query p50/p95/p99, claim/recovery buffer probes, physical dead tuples, relation sizes, per-run-table autovacuum count/time, cluster-wide autovacuum relation I/O, total WAL bytes, and pool waits. Synthetic history isolates the effect of retained rows; the short workflows generate real claim/checkpoint/finish updates. Short local runs do not establish cold-cache or long-term production performance.
 
-One paired local PostgreSQL 18.6 Podman run, using fresh containers per profile and 45-second stages, measured:
+One paired local PostgreSQL 18.6 Podman run, using fresh containers per profile and 45-second stages, measured the following on the **previous** schema (text IDs, per-claim heartbeats); it has not been repeated on the current one:
 
 | Retained terminal runs | Default claim p95 | Tuned claim p95 | Default / tuned run-table autovacuums |
 | ---: | ---: | ---: | ---: |
