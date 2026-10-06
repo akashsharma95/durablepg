@@ -181,7 +181,7 @@ Completed, failed, and cancelled runs and checkpoints have no automatic TTL. Del
 
 ## Benchmarks
 
-The repository's benchmarks use a real PostgreSQL instance and isolated databases via `pgtestdb`. The table compares the previous design, the current one, and the [Rust port](https://github.com/akashsharma95/durable-workflow-rs) it was aligned with. All three ran in alternation on one host (Apple M5 Max, PostgreSQL 18 in Podman), three rounds each, with the same settings: 1,000 runs per workload into a fresh schema from four producers, poll 10 ms, lease 5 s, heartbeat 1 s, a pool of `max(4, CPUs)`, four slots unless noted, `GOMAXPROCS=4` and a four-thread Tokio runtime. Rust used fixed-count probes that mirror these Go benchmarks rather than its Criterion suite.
+The repository's benchmarks use a real PostgreSQL instance and isolated databases via `pgtestdb`. The table compares the previous design, the current one, and the [Rust port](https://github.com/akashsharma95/durablepg-rs) it was aligned with. All three ran in alternation on one host (Apple M5 Max, PostgreSQL 18 in Podman), three rounds each, with the same settings: 1,000 runs per workload into a fresh schema from four producers, poll 10 ms, lease 5 s, heartbeat 1 s, a pool of `max(4, CPUs)`, four slots unless noted, `GOMAXPROCS=4` and a four-thread Tokio runtime. Rust used fixed-count probes that mirror these Go benchmarks rather than its Criterion suite.
 
 | Workload | Previous Go | Current Go | Rust |
 | --- | ---: | ---: | ---: |
